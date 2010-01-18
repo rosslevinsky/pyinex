@@ -1,0 +1,33 @@
+Pyinex - a project to embed Python in Excel
+CHANGES.TXT
+-------------------------------------------
+
+Version 0.83 alpha  - January 18, 2010
+Copyright (c) 2010, Ross Levinsky
+
+
+1) This is the first version of Pyinex to include the source code in its distribution.
+
+2) Pyinex can now load Python files that have a path containing non-ASCII (Unicode) characters, or are themselves named with non-ASCII characters. Python is broken with respect to this functionality, so Pyinex hacks it by using Windows short path names (paths which are computed to the 8.3 standard), as they seem to only contain ASCII characters.
+
+This is a fragile hack, as the use of short filenames can be disabled in Windows. The proper long-term fix is to fix Python.
+
+3) Pyinex now understands Python function definitions that contain a vararg (any *variable_name defined in a function's def statement). If a varargs-containing function is called, all 15 parameters are passed to the function, with N individually specified parameter filled first and (15-N) remaining parameters passed in in the vararg tuple.
+
+Pyinex does not handle named parameters (name=value pairs passed to functions), because it's not obvious how to decide whether a 'name=value' cell in Excel is a true named parameter, or merely a string that contains text that looks like a named parameter (but isn't).
+
+4) Eliminated unnecessary insertion of module search paths into sys.path. Pyinex keeps track of the module search directories it has added, and skips any redundant inserts.
+
+5) Added an implementation of a dummy pyinex class in PyinexExtensionTest.py, to demonstrate how scripts that use the XLL's built-in pyinex module functions can be run standalone (outside of Excel).
+
+6) Added PyModuleFreshnessCheck, a function that lets the user disable polling for module file changes. This improves performance, but also means that code changes aren't picked up until Excel is restarted (or the polling is turned back on).
+
+-------------------------------------------
+
+Version 0.82 - July 9, 2009
+Copyright (c) 2009, Ross Levinsky
+
+This is the first workable production version. It supports Excel 2002, presumably Excel 2003, and Excel 2007, and the python.org distributions of Python 2.5, 2.6, and 3.1. Unicode string handling is supported.
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     >>>>>>> .r178

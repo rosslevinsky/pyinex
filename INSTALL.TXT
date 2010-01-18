@@ -1,0 +1,24 @@
+Pyinex - a project to embed Python in Excel
+INSTALL.TXT
+-------------------------------------------
+
+Version 0.83 alpha  - January 18, 2010
+Copyright (c) 2010, Ross Levinsky
+
+
+Installing Pyinex
+-----------------
+
+1) Make sure you've got Python 2.5, 2.6, or 3.1 installed. I have only tested Pyinex against the standard distributions from python.org.
+
+2) Make sure that the directory containing python(25|26|31).dll is in your PATH environment variable. If it's not, and it's not in a well-known location (such as Windows\System32), Pyinex won't be able to load the Python library at startup. IF YOU HAVE INSTALLED A STANDARD PYTHON DISTRIBUTION FROM PYTHON.ORG, THIS IS UNLIKELY TO BE A PROBLEM.
+
+3) As a convenience, the Pyinex distribution contains prebuilt versions of the release XLLs in the Bin directory. If you build Pyinex, you'll find the resulting XLLs (both debug and release) are also copied into Bin.
+
+4) See the BUILD.TXT file for details on the Pyinex XLL naming convention. As a summary, the py25/py26/py31 in the filenames refer to the Python version, and the "mt" version is the release version (almost certainly what you want to install unless you've built the XLL yourself). 
+
+5) Copy the XLL corresponding to the version of Python that you'll be using into a convenient location of your choice, and then add it to Excel as you would any other add-in. In Excel 2002/2003, this means going to Tools (on the menu bar) and selecting "Add-Ins...".
+
+6) After adding the XLL, CLOSE EXCEL AND START IT AGAIN. This minimizes mysterious Excel crashes.
+
+7) After the clean restart, you should be able to load up the example Excel workbooks in the Examples directory. You'll have to edit the path to the .py files referenced in those workbooks (found in cell C1 of the first worksheet of each workbook), pointing at your local install location for the example Python scripts.

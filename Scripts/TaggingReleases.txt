@@ -1,0 +1,3 @@
+Command for tagging release 0.82 was:
+
+svn copy file://"/Z:/Documents/Repository/Pyinex/trunk" file://"/Z:/Documents/Repository/Pyinex/tags/release-0.82" -m "Tagging release 0.82"

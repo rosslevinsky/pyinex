@@ -1,0 +1,87 @@
+Pyinex - a project to embed Python in Excel
+BUILD.TXT
+-------------------------------------------
+
+Version 0.83 alpha  - January 18, 2010
+Copyright (c) 2010, Ross Levinsky
+
+
+Building Pyinex
+---------------
+
+Pyinex was built with Microsoft's free Visual C++ 2008 Express Edition. You should use that or its for-pay siblings for your builds.
+
+Six build configurations are supported:
+
+* Python 2.5 release build
+* Python 2.5 debug build
+* Python 2.6 release build
+* Python 2.6 debug build
+* Python 3.1 release build
+* Python 3.1 debug build
+
+The varying versions need to be handled separately so that the linker can link against the proper Python DLL. Both debug and release configurations generate debug info (in .pdb format); the principal difference is that optimization is turned on in the release builds. There's provision for linking against a debug build of the Python library; see "Missing Python debug DLL," below.
+
+To allow for customization of Python install locations, the build depends on environment variables to provide the location of each version of Python. Set the PYTHON(25|26|31)INSTALL environment variable to the correct location for each version - that's one separate variable, with the given naming convention, for each version. If you don't like this approach, you can directly edit the VC++ project files (.vcproj files) to reflect the proper include location on your system. You'll need to alter not just the preprocessor search location, but also the linker search location, so you can find the python(25|26|31).lib file.
+
+Start the compiler and open Pyinex.sln. Select which of the six build configurations you want to build (debug or release builds for Python (2.5|2.6|3.1)) and build the Pyinex project. The build process copies the XLL binaries to the Bin directory (sibling of the Pyinex project folder).
+
+
+Pyinex XLL naming convention
+----------------------------
+
+Pyinex XLL naming has the following convention:
+
+Pyinex(3 digit Pyinex version)-py(two digit Python version)-vc(two digit compiler version-(threading model of the CRT)(debug build).xll
+
+So:
+
+Pyinex083-py25-vc90-mtd.xll is Pyinex version 0.83, linking against Python 2.5, compiled on version 9.0 of the VC++ compiler (Visual Studio 2008), linking against the multithreaded debug C runtime library.
+
+The non-debug version is Pyinex083-py25-vc90-mt.xll ("mt" instead of "mtd").
+
+
+Missing Python debug DLL
+------------------------
+
+The standard Python binary distributions only include python(25|26|31).dll, which is a release build of the Python interpreter as a dynamically-loadable library. Unfortunately, the Python.h header file has an include that tries to force linking of python(25|26|31)_d.dll, a debug library, whenever the embedding project builds with the DEBUG flag. Lacking this library or a workaround, you can't build a debug Pyinex release.
+
+There are four solutions to this problem:
+
+1) Convince python.org to include the debug library in their future distributions. It's a good idea, but it may take a while to get done.
+
+2) Build the code yourself and put python(25|26|31)_d.dll and python(25|26|31)_d.lib (the static import lib) somewhere where the linker can find them. This is what I do on my development machine, so I can step into the Python interpreter when needed. I define PYTHON_DEBUG_BUILD_PRESENT in those configurations.
+
+3) Include the Python.h file in a very localized "non-debug" context by undefining DEBUG right before including Python.h, then immediately redefining it afterwards. That's what I do in Utils/PythonWrapper.h, but I control the activation of that hack via the definition of PYTHON_DEBUG_BUILD_PRESENT.
+
+If you are forced to go with choice 3 (don't have the debug Python DLL and won't build it or can't otherwise obtain it), make sure PYTHON_DEBUG_BUILD_PRESENT is undefined (else you won't be able to build Pyinex). 
+
+4) Only build the Release version of Pyinex. This is fine with the current build settings - you'll be able to step into the Pyinex code (with the usual caveats about debugging release builds), but not into the Python interpreter.
+
+Solution 3 is used in the Pyinex distribution; all debug builds link against the release Python DLL.
+
+
+Building against a different version of Python
+----------------------------------------------
+
+I haven't tested versions of Python earlier than 2.5 or later than 3.1. If you want to try pre-2.5 versions, you should either edit the .vcproj files to point to the earlier version's headers and libs, or set/modify the PYTHON(25|26|31)INSTALL environment variable.
+
+
+Included version of XLW
+-----------------------
+
+For convenience, XLW 4.0 is included in this package, and it is compiled as part of the Pyinex build. Pyinex uses it nearly-unmodified; I had to put in one (presumed) fix to make Unicode string handling work. 
+
+Specifically, in XLW 4.0's XlfOperImpl12.cpp file, on line 350 I changed:
+
+   tmp[k]= static_cast<char>(((*xlfOper.lpxloper12_).val.str)[k+1]);
+
+to 
+
+   tmp[k]= static_cast<wchar_t>(((*xlfOper.lpxloper12_).val.str)[k+1]);
+
+I also changed the output filename to not use the ProjectName macro, because I had to change the project name to get the project to display sensibly (as xlw_4_0_0f0) in Visual Studio. Thus, I hardcoded the output filenames.
+  
+You can get the latest version of XLW from xlw.sourceforge.net.
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             >>>>>>> .r178
