@@ -1,0 +1,19 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "x64",
+      "hidden": true,
+      "description": "MSVC, x64, with the newest Visual Studio CMake finds",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "architecture": { "value": "x64", "strategy": "set" }
+    },
+    { "name": "x64-debug", "inherits": "x64", "displayName": "x64 Debug" },
+    { "name": "x64-release", "inherits": "x64", "displayName": "x64 Release" }
+  ],
+  "buildPresets": [
+    { "name": "x64-debug", "configurePreset": "x64-debug", "configuration": "Debug" },
+    { "name": "x64-release", "configurePreset": "x64-release", "configuration": "RelWithDebInfo" }
+  ]
+}

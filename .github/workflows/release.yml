@@ -1,0 +1,74 @@
+# On a version tag (v2026.10.0), builds Pyinex, runs the tests that need no Excel, and
+# publishes a GitHub release: the add-in as a zip, with that version's CHANGELOG.md entry
+# as its notes.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      # The core compiles against the newest Python's headers (CMakeLists.txt).
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.15"
+          architecture: x64
+
+      - name: Check the tag names the version CMakeLists.txt sets
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          grep -q "project(pyinex VERSION $version " CMakeLists.txt \
+            || { echo "CMakeLists.txt does not set version $version"; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: cmake --preset x64-release
+
+      - name: Build
+        run: cmake --build --preset x64-release
+
+      - name: Install pytest and openpyxl
+        run: python -m pip install pytest openpyxl
+
+      - name: Test
+        env:
+          PYINEX_BUILD_DIR: build/x64-release/bin
+        run: python -m pytest tests/unit tests/host -q
+
+      - name: Package
+        run: |
+          mkdir "pyinex-$VERSION"
+          cp build/x64-release/bin/pyinex.xll build/x64-release/bin/pyinex_core.dll \
+             LICENSE NOTICE "pyinex-$VERSION/"
+          7z a "pyinex-$VERSION-x64.zip" "pyinex-$VERSION"
+
+      # The notes are the lines under "## <version>" in CHANGELOG.md, up to the next "## ".
+      - name: Write the release notes
+        run: |
+          python - <<'EOF'
+          import os, re
+          version = os.environ["VERSION"]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(rf"^## {re.escape(version)}\b.*?\n(.*?)(?=^## |\Z)", text, re.M | re.S)
+          if not m:
+              raise SystemExit(f"CHANGELOG.md has no entry for {version}")
+          open("notes.md", "w", encoding="utf-8").write(m.group(1).strip() + "\n")
+          EOF
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "pyinex-$VERSION-x64.zip" \
+            --title "Pyinex $VERSION" --notes-file notes.md --verify-tag

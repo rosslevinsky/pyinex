@@ -1,0 +1,17 @@
+Pyinex
+Copyright (c) 2009-2026, Ross Levinsky. Licensed under the BSD 3-Clause License (LICENSE).
+
+Third-party material
+--------------------
+
+Microsoft Excel 2013 XLL SDK
+
+  The add-in is compiled against XLCALL.H, the type and constant definitions of
+  Microsoft's Excel 2013 XLL SDK. It is not in this repository: its license
+  (ExcelSDK_eula.rtf, inside the SDK's installer) forbids redistributing it, so the build
+  downloads the installer from Microsoft and unpacks it in the build folder (sdk/README.md
+  in the source repository). The built pyinex.xll and pyinex_core.dll contain no code
+  from the SDK.
+
+No other third-party code is included. Earlier versions were built on the xlw library;
+none of its code remains.

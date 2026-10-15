@@ -1,0 +1,8 @@
+build/
+out/
+__pycache__/
+*.pyc
+.venv/
+CMakeUserPresets.json
+*.user
+.DS_Store

@@ -1,0 +1,93 @@
+# Builds Pyinex on Windows once, then runs the tests that need no Excel (tests/unit and
+# tests/host) under each supported Python, all against that one build. See docs/testing.md.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The core compiles against the newest Python's headers, so anything deprecated
+      # there fails the build (CMakeLists.txt).
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.15"
+          architecture: x64
+
+      - name: Check the C++ size budget
+        run: python scripts/count_lines.py
+
+      # Configuring downloads Microsoft's Excel SDK installer (sdk/README.md).
+      - name: Configure
+        run: cmake --preset x64-release
+
+      - name: Build
+        run: cmake --build --preset x64-release
+
+      - name: Upload the add-in
+        uses: actions/upload-artifact@v7
+        with:
+          name: pyinex
+          path: |
+            build/x64-release/bin/pyinex.xll
+            build/x64-release/bin/pyinex_core.dll
+          if-no-files-found: error
+
+      - name: Upload the test harness
+        uses: actions/upload-artifact@v7
+        with:
+          name: pyinex-test-harness
+          path: |
+            build/x64-release/bin/xllhost.exe
+            build/x64-release/bin/xllhost_gui.exe
+            build/x64-release/bin/badxll.xll
+            build/x64-release/bin/fakepython.exe
+            build/x64-release/bin/_pyinex_testing.pyd
+          if-no-files-found: error
+
+  test:
+    needs: build
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+    name: test (Python ${{ matrix.python }})
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: x64
+
+      # openpyxl reads the example workbooks (tests/unit/test_examples.py).
+      - name: Install pytest and openpyxl
+        run: python -m pip install pytest openpyxl
+
+      # Both artifacts come from the one build above: nothing is rebuilt here.
+      - uses: actions/download-artifact@v8
+        with:
+          name: pyinex
+          path: bin
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: pyinex-test-harness
+          path: bin
+
+      - name: Unit tests
+        env:
+          PYINEX_BUILD_DIR: bin
+        run: python -m pytest tests/unit -v
+
+      - name: Test against the fake Excel
+        if: success() || failure()
+        env:
+          PYINEX_BUILD_DIR: bin
+        run: python -m pytest tests/host -v
