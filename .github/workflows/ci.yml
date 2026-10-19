@@ -66,9 +66,10 @@ jobs:
           python-version: ${{ matrix.python }}
           architecture: x64
 
-      # openpyxl reads the example workbooks (tests/unit/test_examples.py).
-      - name: Install pytest and openpyxl
-        run: python -m pip install pytest openpyxl
+      # openpyxl reads the example workbooks (tests/unit/test_examples.py). NumPy is for the
+      # numpy.ndarray annotation's tests, which fail without it rather than skip.
+      - name: Install pytest, openpyxl and NumPy
+        run: python -m pip install pytest openpyxl numpy
 
       # Both artifacts come from the one build above: nothing is rebuilt here.
       - uses: actions/download-artifact@v8
@@ -91,3 +92,11 @@ jobs:
         env:
           PYINEX_BUILD_DIR: bin
         run: python -m pytest tests/host -v
+
+      # Both folders in one run, as a release's checks run them: a test that imports from
+      # conftest inside a function finds the other folder's conftest only here.
+      - name: Unit and fake-Excel tests together
+        if: success() || failure()
+        env:
+          PYINEX_BUILD_DIR: bin
+        run: python -m pytest tests -q

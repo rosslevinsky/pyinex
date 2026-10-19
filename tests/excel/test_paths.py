@@ -56,7 +56,7 @@ def test_a_folder_with_brackets_and_a_sheet_named_like_the_workbook(workbook, tm
 def test_an_unsaved_workbook_refuses_a_relative_path(workbook, cleared, tmp_path):
     unsaved = workbook()
     assert unsaved.formula("A1", pycall("anything.py", "f")) == E("#VALUE!")
-    said = "Pyinex: cannot find the script anything.py: a relative path is relative to the workbook's folder, and this workbook has not been saved"
+    said = "Pyinex: cannot find the script anything.py: a relative path is relative to the workbook's folder, and this workbook has not been saved; give the script's full path instead"
     window = cleared(said)
     assert window and said in window.text
     script = tmp_path / "absolute_from_unsaved.py"

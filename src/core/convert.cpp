@@ -1,5 +1,7 @@
 #include "core/convert.h"
 
+#include "core/python/excel_error.py.h"
+
 #include <algorithm>
 #include <cmath>
 #include <format>
@@ -22,49 +24,6 @@ constexpr ErrorText errors[] = {
     {xlerrRef, "#REF!"},   {xlerrName, "#NAME?"},  {xlerrNum, "#NUM!"},
     {xlerrNA, "#N/A"},     {xlerrGettingData, "#GETTING_DATA"},
 };
-
-// Defines ExcelError, given the error texts above as a tuple.
-constexpr const char* error_source = R"(
-def make(texts):
-    class ExcelError:
-        """An Excel error, such as #N/A.
-
-        An error in a cell arrives in Python as an ExcelError, and a function returns one
-        to put that error in its cell. ExcelError('#N/A') makes one; str(e) and e.text give
-        its text.
-        """
-        __slots__ = ('_text',)
-        __module__ = 'pyinex'
-        __qualname__ = 'ExcelError'
-
-        def __init__(self, text):
-            # str.__str__ gives a plain str, so a subclass's own comparison is never used.
-            plain = str.__str__(text) if isinstance(text, str) else None
-            if plain not in texts:
-                shown = repr(plain) if plain is not None else 'a ' + type(text).__name__
-                raise ValueError(f'not an Excel error: {shown}; expected one of {", ".join(texts)}')
-            self._text = plain
-
-        @property
-        def text(self):
-            return self._text
-
-        def __str__(self):
-            return self._text
-
-        def __repr__(self):
-            return f'ExcelError({self._text!r})'
-
-        def __eq__(self, other):
-            if isinstance(other, ExcelError):
-                return self._text == other._text
-            return NotImplemented
-
-        def __hash__(self):
-            return hash(self._text)
-
-    return ExcelError
-)";
 
 PyObject* error_type;  // ExcelError, once start_conversion has made it.
 
@@ -114,15 +73,22 @@ PyObject* array_to_python(const XLOPER12& x, std::wstring& problem) {
         cells.emplace_back(cell_to_python(a.lparray[i], problem));
         if (!cells.back().get()) return nullptr;
     }
-    Ref rows(PyTuple_New(a.rows));
-    if (!rows.get()) return nullptr;
+    // Each row is made and filled before the tuple holding them: a garbage collection, which
+    // making a tuple can start, must never find a tuple still being filled.
+    std::vector<Ref> rows;
+    rows.reserve(static_cast<size_t>(a.rows));
     for (int r = 0; r < a.rows; ++r) {
-        PyObject* row = PyTuple_New(a.columns);
-        if (!row || PyTuple_SetItem(rows.get(), r, row) < 0) return nullptr;  // Steals row.
+        Ref row(PyTuple_New(a.columns));
+        if (!row.get()) return nullptr;
         for (int c = 0; c < a.columns; ++c)
-            if (PyTuple_SetItem(row, c, cells[static_cast<size_t>(r) * a.columns + c].release()) < 0) return nullptr;
+            if (PyTuple_SetItem(row.get(), c, cells[static_cast<size_t>(r) * a.columns + c].release()) < 0) return nullptr;
+        rows.push_back(std::move(row));
     }
-    return rows.release();
+    Ref all(PyTuple_New(a.rows));
+    if (!all.get()) return nullptr;
+    for (int r = 0; r < a.rows; ++r)
+        if (PyTuple_SetItem(all.get(), r, rows[static_cast<size_t>(r)].release()) < 0) return nullptr;
+    return all.release();
 }
 
 bool is_sequence(PyObject* o) { return PyList_Check(o) || PyTuple_Check(o); }
@@ -202,12 +168,9 @@ bool cell_to_excel(PyObject* o, Value& out, std::wstring& why) {
 }  // namespace
 
 bool start_conversion() {
-    Ref names(PyDict_New());
-    Ref builtins(PyImport_ImportModule("builtins"));
-    Ref ran(names.get() && builtins.get()
-                ? PyObject_CallMethod(builtins.get(), "exec", "sO", error_source, names.get())
-                : nullptr);
-    PyObject* make = ran.get() ? PyDict_GetItemString(names.get(), "make") : nullptr;  // Borrowed.
+    // src/core/python/excel_error.py defines make(texts), which makes the type.
+    Ref names(run_core_python(python::excel_error_py, "excel_error.py"));
+    PyObject* make = names.get() ? PyDict_GetItemString(names.get(), "make") : nullptr;  // Borrowed.
     Ref texts(PyTuple_New(std::size(errors)));
     bool ok = make && texts.get();
     for (size_t i = 0; ok && i < std::size(errors); ++i) {
@@ -215,10 +178,7 @@ bool start_conversion() {
         ok = text && PyTuple_SetItem(texts.get(), static_cast<Py_ssize_t>(i), text) == 0;
     }
     Ref type(ok ? PyObject_CallFunctionObjArgs(make, texts.get(), nullptr) : nullptr);
-    if (!type.get()) {
-        PyErr_Clear();
-        return false;
-    }
+    if (!type.get()) return false;  // Python's error is left for pyinex_start to report.
     Py_XDECREF(error_type);
     error_type = type.release();
     return true;

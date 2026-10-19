@@ -5,12 +5,17 @@
 #include "core/api.h"
 
 #include <string>
+#include <vector>
 
 namespace pyinex::loader {
 
 // pyinex_core.dll's functions.
 struct Core {
     pyinex_call_t* call = nullptr;
+    pyinex_load_t* load = nullptr;
+    pyinex_function_t* function = nullptr;
+    pyinex_registered_t* registered = nullptr;
+    pyinex_changes_t* changes = nullptr;
     pyinex_info_t* info = nullptr;
     pyinex_close_t* close = nullptr;
     std::wstring executable;  // The python.exe chosen.
@@ -32,6 +37,10 @@ void pin();
 
 // The add-in's own path.
 std::wstring addin_path();
+
+// The scripts pyinex.ini's scripts key lists, separated by semicolons, as full paths: a
+// relative one is relative to the add-in's folder. Empty if there are none.
+std::vector<std::wstring> startup_scripts();
 
 // Called by xlAutoOpen: a refused Python gets a fresh attempt when the add-in reopens.
 void forget_refusal();

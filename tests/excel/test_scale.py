@@ -1,12 +1,15 @@
 """Many calls in real Excel leak nothing (docs/architecture.md, "Lifetime"): Excel's handle
 count and private memory after 1,000 warm-up calls and after 10,000 more, and every
-result right.
+result right; for PyCall and for a direct function. And many reloads leak nothing: a
+script's, and a direct function's registration made again (the direct-functions test
+group 11).
 """
 
 import ctypes
+import time
 from ctypes import wintypes
 
-from conftest import EXCEL_PID, pycall
+from conftest import EXCEL_PID, E, pycall, shown
 
 CELLS = 1000
 ROUNDS = 10
@@ -103,3 +106,60 @@ def test_ten_thousand_calls_leak_nothing(book, pytestconfig):
           f"after {CELLS * ROUNDS} more: {last[0]} handles, {last[1] / 2**20:.1f} MB")  # fmt: skip
     assert last[0] - first[0] <= MOST_HANDLES, f"{last[0] - first[0]} more handles"
     assert last[1] - first[1] <= MOST_MEMORY, f"{(last[1] - first[1]) / 2**20:.1f} MB more private memory"
+
+
+def test_ten_thousand_direct_function_calls_leak_nothing(app, book, pytestconfig):
+    pid = pytestconfig.stash[EXCEL_PID]
+    book.script(
+        "sc_direct.py",
+        "import pyinex\n\n@pyinex.func\ndef ScDirect(row, block):\n"
+        "    return f'row {int(row)}: ' + ','.join(str(int(v)) for r in block for v in r)\n",
+    )
+    assert book.formula("F1", '=PyLoad("sc_direct.py")') == "1 function"
+    deadline = time.monotonic() + 15
+    while shown(app.Evaluate("ScDirect(1, 1)")) == E("#NAME?") and time.monotonic() < deadline:
+        time.sleep(0.1)
+    book.sheet.Range("C1:D2").Value2 = ((1, 2), (3, 4))
+    book.sheet.Range(f"A1:A{CELLS}").Formula = "=ScDirect(ROW(), $C$1:$D$2)"  # The 1,000 warm-up calls.
+    expected = [f"row {r}: 1,2,3,4" for r in range(1, CELLS + 1)]
+    assert [row[0] for row in book.values(f"A1:A{CELLS}")] == expected
+    first = handles_and_memory(pid)
+    for round in range(ROUNDS):
+        book.excel.CalculateFull()
+        assert [row[0] for row in book.values(f"A1:A{CELLS}")] == expected, f"round {round + 1}"
+    last = handles_and_memory(pid)
+    print(f"after {CELLS * ROUNDS} direct calls: {last[0] - first[0]:+} handles, {(last[1] - first[1]) / 2**20:+.1f} MB")
+    assert last[0] - first[0] <= MOST_HANDLES, f"{last[0] - first[0]} more handles"
+    assert last[1] - first[1] <= MOST_MEMORY, f"{(last[1] - first[1]) / 2**20:.1f} MB more private memory"
+
+
+REGISTRATIONS = 200
+
+
+def test_registering_again_hundreds_of_times_leaks_nothing(app, book, pytestconfig):
+    # Each reload changes the signature, so the function is removed, its name cleared, and
+    # registered again through the queue.
+    pid = pytestconfig.stash[EXCEL_PID]
+    source = "import pyinex\n\n@pyinex.func\ndef ScAgain({0}):\n    return 'v{1}'\n"
+
+    def version(n):
+        return source.format("a" if n % 2 else "a, b", n)
+
+    book.script("sc_again.py", version(0))
+    assert book.formula("F1", '=PyLoad("sc_again.py")') == "1 function"
+    first = None
+    for n in range(1, REGISTRATIONS + 1):
+        book.script("sc_again.py", version(n))
+        assert book.formula("F1", '=PyLoad("sc_again.py")') == "1 function"
+        call = "ScAgain(1)" if n % 2 else "ScAgain(1, 2)"
+        deadline = time.monotonic() + 15
+        while shown(app.Evaluate(call)) != f"v{n}" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert shown(app.Evaluate(call)) == f"v{n}", n
+        if n == 20:
+            first = handles_and_memory(pid)  # After a warm-up.
+    last = handles_and_memory(pid)
+    print(f"after {REGISTRATIONS - 20} registrations again: {last[0] - first[0]:+} handles, "
+          f"{(last[1] - first[1]) / 2**20:+.1f} MB")
+    assert last[0] - first[0] <= MOST_RELOAD_HANDLES
+    assert last[1] - first[1] <= MOST_MEMORY

@@ -1,10 +1,13 @@
 #include "core/module.h"
 
+#include "console/console.h"
+#include "core/call.h"
 #include "core/convert.h"
 #include "core/py.h"
 #include "excel/address.h"
 #include "excel/excel.h"
 
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -16,15 +19,29 @@ using excel::Value;
 
 DWORD calling_thread;  // The thread Excel is calling the add-in on; 0 between calls.
 
+// Raises RuntimeError, and returns false, for a call Excel stopped (excel::stop_code).
+bool stopped(const char* function) {
+    PyErr_Format(PyExc_RuntimeError,
+                 excel::stop_code == xlretUncalced
+                     ? "pyinex.%s cannot ask Excel: a cell this call reads is not yet calculated, and Excel calls "
+                       "the function again once it is"
+                     : "pyinex.%s cannot ask Excel: the calculation was interrupted, and Excel calls the function "
+                       "again in the next calculation",
+                 function);
+    return false;
+}
+
 // Raises RuntimeError, and returns false, unless the module may ask Excel now. Excel's C API
 // may be called only on the thread Excel called the add-in on, while it waits for the
 // result; anything else can crash it.
 bool may_ask_excel(const char* function) {
+    if (excel::stop_code > 0 && calling_thread == GetCurrentThreadId()) return stopped(function);
     if (calling_thread != 0 && calling_thread == GetCurrentThreadId()) return true;
     PyErr_Format(PyExc_RuntimeError,
                  calling_thread != 0
                      ? "pyinex.%s asks Excel, which allows that only on Excel's own thread, not one a script started"
-                     : "pyinex.%s asks Excel, which allows that only while Excel is calculating a PyCall",
+                     : "pyinex.%s asks Excel, which allows that only while Excel is calculating a PyCall or a "
+                       "direct function",
                  function);
     return false;
 }
@@ -40,7 +57,7 @@ const XLREF12* calling_area(const ExcelValue& caller) {
     if (type_of(x) == xltypeSRef) return &x.val.sref.ref;
     if (type_of(x) == xltypeRef && x.val.mref.lpmref && x.val.mref.lpmref->count >= 1)
         return &x.val.mref.lpmref->reftbl[0];
-    PyErr_SetString(PyExc_RuntimeError, "the PyCall running was not called from a cell");
+    PyErr_SetString(PyExc_RuntimeError, "the function running was not called from a cell");
     return nullptr;
 }
 
@@ -120,6 +137,66 @@ PyObject* esc_pressed(PyObject*, PyObject* args, PyObject* keywords) {
     });
 }
 
+// A Range's question about one area of the sheet with Excel's ID sheet, its rows and
+// columns counted from 0: what is in it (xlCoerce), or with count how many cells hold
+// anything (COUNTA), which Excel answers without handing over the cells.
+PyObject* range_ask(PyObject* args, bool count) {
+    unsigned long long sheet = 0;
+    XLMREF12 area{.count = 1};
+    XLREF12& a = area.reftbl[0];
+    if (!PyArg_ParseTuple(args, "Kiiii", &sheet, &a.rwFirst, &a.rwLast, &a.colFirst, &a.colLast) ||
+        !may_ask_excel("Range"))
+        return nullptr;
+    return guarded([&]() -> PyObject* {
+        XLOPER12 ref{.xltype = xltypeRef}, multi{.xltype = xltypeInt};
+        ref.val.mref = {.lpmref = &area, .idSheet = static_cast<IDSHEET>(sheet)};
+        multi.val.w = xltypeMulti;
+        ExcelValue answer;
+        const int ret = count ? excel::call(xlfCounta, &answer, {&ref}) : excel::call(xlCoerce, &answer, {&ref, &multi});
+        if (ret == xlretUncalced || ret == xlretAbort) {
+            stopped("Range");
+            return nullptr;
+        }
+        if (ret != xlretSuccess || (count && type_of(answer.get()) != xltypeNum)) {
+            PyErr_Format(PyExc_RuntimeError, "Excel did not read the cells of a pyinex.Range (xlret %d)", ret);
+            return nullptr;
+        }
+        if (count) return PyFloat_FromDouble(answer.get().val.num);
+        std::wstring problem;
+        PyObject* values = to_python(answer.get(), problem);
+        if (!values) {  // Python failed, and to_python said how.
+            Ref why(to_str(L"pyinex.Range: " + problem));
+            PyErr_SetObject(PyExc_RuntimeError, why.get() ? why.get() : Py_None);
+        } else if (!problem.empty()) {  // A value Pyinex does not know, which arrives as #VALUE!.
+            console::note(L"pyinex.Range: " + problem);
+        }
+        return values;
+    });
+}
+
+PyObject* range_values(PyObject*, PyObject* args) { return range_ask(args, false); }
+
+PyObject* range_count(PyObject*, PyObject* args) { return range_ask(args, true); }
+
+// The ID of the sheet Excel names name, such as [Book.xlsx]Sheet1, or None if Excel has no
+// such sheet open.
+PyObject* sheet_id(PyObject*, PyObject* args) {
+    PyObject* name = nullptr;
+    if (!PyArg_ParseTuple(args, "U", &name) || !may_ask_excel("Range")) return nullptr;
+    return guarded([&]() -> PyObject* {
+        Py_ssize_t size = 0;
+        std::unique_ptr<wchar_t, void (*)(void*)> chars(PyUnicode_AsWideCharString(name, &size), PyMem_Free);
+        if (!chars) return nullptr;
+        const Value text = Value::text({chars.get(), static_cast<size_t>(size)});
+        ExcelValue id;
+        if (excel::call(xlSheetId, &id, {&text.get()}) != xlretSuccess || type_of(id.get()) != xltypeRef)
+            return Py_NewRef(Py_None);
+        return PyLong_FromUnsignedLongLong(id.get().val.mref.idSheet);
+    });
+}
+
+PyObject* excel_stopped(PyObject*, PyObject*) { return PyBool_FromLong(excel::stop_code > 0); }
+
 // PyCFunctionWithKeywords is cast to PyCFunction, as METH_KEYWORDS requires.
 template <class F>
 PyCFunction as_function(F f) {
@@ -136,11 +213,16 @@ PyMethodDef methods[] = {
      "esc_pressed(clear=False)\n--\n\n"
      "Whether the user has pressed Esc during this calculation. clear=True makes Excel forget\n"
      "the key press, so other cells checking see False until Esc is pressed again."},
+    // Private, for pyinex.Range (src/core/python/funcs.py).
+    {"_range_values", range_values, METH_VARARGS, nullptr},
+    {"_range_count", range_count, METH_VARARGS, nullptr},
+    {"_sheet_id", sheet_id, METH_VARARGS, nullptr},
+    {"_stopped", excel_stopped, METH_NOARGS, nullptr},
     {nullptr, nullptr, 0, nullptr},
 };
 
 PyModuleDef definition = {
-    PyModuleDef_HEAD_INIT, "pyinex", "Pyinex's functions for scripts that Excel calls through PyCall.", -1, methods,
+    PyModuleDef_HEAD_INIT, "pyinex", "Pyinex's functions for the scripts Excel calls.", -1, methods,
     nullptr, nullptr, nullptr, nullptr,
 };
 
@@ -150,13 +232,31 @@ bool start_module() {
     Ref module(PyModule_Create(&definition));
     PyObject* modules = PyImport_GetModuleDict();  // Borrowed.
     const bool ok = module.get() && PyModule_AddObjectRef(module.get(), "ExcelError", excel_error_type()) == 0 &&
+                    helper("func") && PyModule_AddObjectRef(module.get(), "func", helper("func")) == 0 &&
+                    helper("Range") && PyModule_AddObjectRef(module.get(), "Range", helper("Range")) == 0 &&
                     PyDict_SetItemString(modules, "pyinex", module.get()) == 0;
-    if (!ok) PyErr_Clear();
-    return ok;
+    return ok;  // If not, Python's error is left for pyinex_start to report.
 }
 
-ExcelCall::ExcelCall() : outer_(calling_thread) { calling_thread = GetCurrentThreadId(); }
+ExcelCall::ExcelCall() : outer_(calling_thread), outer_stop_(excel::stop_code) {
+    calling_thread = GetCurrentThreadId();
+    excel::stop_code = 0;
+}
 
-ExcelCall::~ExcelCall() { calling_thread = outer_; }
+ExcelCall::~ExcelCall() {
+    calling_thread = outer_;
+    excel::stop_code = outer_stop_;
+}
+
+OutsideCall::OutsideCall() : outer_(calling_thread), outer_stop_(excel::stop_code) {
+    calling_thread = 0;
+    // A call Excel stopped stays stopped: it may still call nothing of Excel's but xlFree.
+    if (excel::stop_code <= 0) excel::stop_code = -1;
+}
+
+OutsideCall::~OutsideCall() {
+    calling_thread = outer_;
+    excel::stop_code = outer_stop_;
+}
 
 }  // namespace pyinex::core

@@ -14,6 +14,7 @@
 #include <iterator>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -125,7 +126,8 @@ fs::path registered_python() {
 // A value from pyinex.ini's [python] section, or empty. Read here, not with
 // GetPrivateProfileStringW, which takes a file with no byte-order mark to be in the 8-bit
 // code page, while editors save UTF-8: a path such as C:\Users\Zoë\... would come back as
-// another path. A UTF-16 file, which Windows reads right, still goes to Windows.
+// another path. A UTF-16 little-endian file, which Windows reads right, still goes to
+// Windows; a big-endian one, which Windows does not read, is read here.
 std::wstring ini_value(const fs::path& ini, const std::wstring& key) {
     std::ifstream f(ini, std::ios::binary);
     std::string bytes{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
@@ -135,12 +137,24 @@ std::wstring ini_value(const fs::path& ini, const std::wstring& key) {
                                               static_cast<DWORD>(value.size()), ini.c_str()));
         return trim(value);
     }
-    if (bytes.starts_with("\xEF\xBB\xBF")) bytes.erase(0, 3);
-    const int size = static_cast<int>(bytes.size());
-    std::wstring text = utf8_to_wide(bytes);
-    if (size > 0 && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(), size, nullptr, 0) == 0) {
-        text.assign(static_cast<size_t>(MultiByteToWideChar(CP_ACP, 0, bytes.data(), size, nullptr, 0)), L'\0');
-        MultiByteToWideChar(CP_ACP, 0, bytes.data(), size, text.data(), static_cast<int>(text.size()));  // As Windows reads it.
+    std::wstring text;
+    if (bytes.starts_with("\xFE\xFF")) {
+        for (size_t i = 2; i + 1 < bytes.size(); i += 2)
+            text += static_cast<wchar_t>(static_cast<unsigned char>(bytes[i]) << 8 | static_cast<unsigned char>(bytes[i + 1]));
+    } else {
+        if (bytes.starts_with("\xEF\xBB\xBF")) bytes.erase(0, 3);
+        if (bytes.find('\0') != bytes.npos) {  // UTF-16 with no byte-order mark, which nothing can tell from 8-bit text.
+            static bool said = false;
+            if (!std::exchange(said, true))
+                console::note(L"cannot read " + ini.wstring() + L": save it as UTF-8, or as UTF-16 with a byte-order mark");
+            return L"";
+        }
+        const int size = static_cast<int>(bytes.size());
+        text = utf8_to_wide(bytes);
+        if (size > 0 && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(), size, nullptr, 0) == 0) {
+            text.assign(static_cast<size_t>(MultiByteToWideChar(CP_ACP, 0, bytes.data(), size, nullptr, 0)), L'\0');
+            MultiByteToWideChar(CP_ACP, 0, bytes.data(), size, text.data(), static_cast<int>(text.size()));  // As Windows reads it.
+        }
     }
     // Windows' rules: lines end at \r or \n, names ignore case, ; starts a comment, only
     // the first [python] section counts, the first match in it wins, and quotes around a
@@ -272,11 +286,15 @@ struct Probe {
     bool finished = false;
     DWORD exit_code = 0;
     std::wstring last_line;  // Of its output: on failure, usually the reason.
+    // Python's own account of a start it could not finish, "Fatal Python error: ..." and the
+    // exception after it, which a dump of its threads then follows.
+    std::wstring fatal;
 
     std::wstring failure() const {
         if (!finished) return L"it did not finish starting within 60 seconds";
         std::wstring s = L"it failed to start (exit code " + std::to_wstring(exit_code) + L")";
-        return last_line.empty() ? s : s + L": " + last_line;
+        const std::wstring& why = fatal.empty() ? last_line : fatal;
+        return why.empty() ? s : s + L": " + why;
     }
 };
 
@@ -287,9 +305,12 @@ struct Probe {
 // stray .py file there (beside a workbook, say) is not imported. Each line it prints starts
 // on a line of its own, whatever start-up printed before it. Written to run on any Python,
 // however old.
+// Its version goes first, written as any Python can, so even one too old for the rest says
+// which it is.
 constexpr const wchar_t* probe_code =
-    L"import sys;sys.path[:1]=[p for p in sys.path[:1] if p];w=lambda k,v:sys.stdout.buffer.write(('\\npyinex-probe:%s=%s\\n'%(k,v)).encode('utf-8'));"
-    L"w('version','%d.%d'%sys.version_info[:2]);import sysconfig,_winapi;"
+    L"import sys;sys.path[:1]=[p for p in sys.path[:1] if p];"
+    L"sys.stdout.write('\\npyinex-probe:version=%d.%d\\n'%sys.version_info[:2]);sys.stdout.flush();"
+    L"w=lambda k,v:sys.stdout.buffer.write(('\\npyinex-probe:%s=%s\\n'%(k,v)).encode('utf-8'));import sysconfig,_winapi;"
     L"w('gil_disabled',sysconfig.get_config_var('Py_GIL_DISABLED') or 0);"
     L"w('dll',_winapi.GetModuleFileName(sys.dllhandle));"
     L"w('base_executable',getattr(sys,'_base_executable',sys.executable))";
@@ -359,6 +380,7 @@ Probe probe(const fs::path& executable) {
     CloseHandle(process.hProcess);
     CloseHandle(read);
 
+    bool fatal_open = false;
     for (size_t start = 0; start < output.size();) {
         size_t end = output.find('\n', start);
         if (end == output.npos) end = output.size();
@@ -368,7 +390,17 @@ Probe probe(const fs::path& executable) {
         constexpr std::wstring_view prefix = L"pyinex-probe:";
         const auto equals = line.find(L'=');
         if (!line.starts_with(prefix) || equals == line.npos) {
-            result.last_line = line;
+            if (line.starts_with(L"Fatal Python error:")) {
+                result.fatal = line;
+                fatal_open = true;
+            } else if (fatal_open && !line.starts_with(L"Python runtime state:") && !line.starts_with(L"Current thread")) {
+                result.fatal += L" (" + line + L")";  // The exception it names.
+                fatal_open = false;
+            }
+            // A dump of its threads says nothing of why.
+            if (!line.starts_with(L"Current thread") && !line.starts_with(L"Thread 0x") && line != L"<no Python frame>" &&
+                !line.starts_with(L"File \""))
+                result.last_line = line;
             continue;
         }
         const std::wstring key = line.substr(prefix.size(), equals - prefix.size()), value = line.substr(equals + 1);
@@ -455,14 +487,21 @@ std::wstring load(const fs::path& executable, const Probe& probed, const fs::pat
     auto* call = reinterpret_cast<pyinex_call_t*>(GetProcAddress(loaded.back(), "pyinex_call"));
     auto* info = reinterpret_cast<pyinex_info_t*>(GetProcAddress(loaded.back(), "pyinex_info"));
     auto* close = reinterpret_cast<pyinex_close_t*>(GetProcAddress(loaded.back(), "pyinex_close"));
-    if (!start || !call || !info || !close) return fail(core_path.wstring() + L" is not this version's core");
+    auto* load_fn = reinterpret_cast<pyinex_load_t*>(GetProcAddress(loaded.back(), "pyinex_load"));
+    auto* function = reinterpret_cast<pyinex_function_t*>(GetProcAddress(loaded.back(), "pyinex_function"));
+    auto* registered = reinterpret_cast<pyinex_registered_t*>(GetProcAddress(loaded.back(), "pyinex_registered"));
+    auto* changes = reinterpret_cast<pyinex_changes_t*>(GetProcAddress(loaded.back(), "pyinex_changes"));
+    if (!start || !call || !info || !close || !load_fn || !function || !registered || !changes)
+        return fail(core_path.wstring() + L" is not this version's core");
     // Python and the core will hold pointers into this add-in, so Windows must never
     // unload it (docs/architecture.md, "Lifetime").
     pin();
     started_python = true;
     if (start(executable.c_str(), probed.base_executable.c_str()) != 0)
-        return L"Python started, but Pyinex could not set it up";
-    core = {.call = call, .info = info, .close = close, .executable = executable.wstring(), .dll = probed.dll.wstring()};
+        return L"Python started, but Pyinex could not set it up; the console says why. Restart Excel once the cause "
+               L"is fixed";
+    core = {.call = call, .load = load_fn, .function = function, .registered = registered, .changes = changes, .info = info, .close = close,
+            .executable = executable.wstring(), .dll = probed.dll.wstring()};
     return L"";
 }
 
@@ -506,6 +545,20 @@ void pin() {
 }
 
 std::wstring addin_path() { return module_path(this_module()).wstring(); }
+
+std::vector<std::wstring> startup_scripts() {
+    const fs::path addin_folder = module_path(this_module()).parent_path();
+    const std::wstring list = ini_value(addin_folder / L"pyinex.ini", L"scripts");
+    std::vector<std::wstring> scripts;
+    for (size_t start = 0; start < list.size();) {
+        size_t end = list.find(L';', start);
+        if (end == list.npos) end = list.size();
+        const std::wstring script = trim(list.substr(start, end - start));
+        start = end + 1;
+        if (!script.empty()) scripts.push_back((addin_folder / script).lexically_normal().wstring());
+    }
+    return scripts;
+}
 
 void forget_refusal() {
     if (state == State::refused && !started_python) {

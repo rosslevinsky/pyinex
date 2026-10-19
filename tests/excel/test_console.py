@@ -105,10 +105,13 @@ def test_a_place_off_the_desktop_is_refused(pyconsole, console, mark, desktop):
     for x, y in [(left + width, top), (left, top + height), (left - 1, top), (left, top - 1)]:
         pyconsole("FALSE", "TRUE")
         assert pyconsole("TRUE", "FALSE", str(x), str(y), "400", "300") == E("#VALUE!"), (x, y)
-        said = "Pyinex: PyConsole: x and y must lie on the desktop"
+        said = f"Pyinex: PyConsole: x and y must lie on a monitor; {x},{y} is on none"
         assert said in mark(), (x, y)
     pyconsole("FALSE")
-    assert pyconsole("TRUE", "FALSE", str(left + width - 1), str(top + height - 1), "400", "300") is True
+    # The main monitor's last pixel: the desktop's own corner may lie on no monitor, where
+    # monitors of different sizes leave it bare.
+    metric = ctypes.windll.user32.GetSystemMetrics
+    assert pyconsole("TRUE", "FALSE", str(metric(0) - 1), str(metric(1) - 1), "400", "300") is True
 
 
 def test_closing_hides_it_and_showing_places_it_again(pyconsole, console, desktop):

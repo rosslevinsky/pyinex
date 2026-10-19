@@ -10,7 +10,8 @@
 namespace pyinex::core {
 
 // Creates the ExcelError class, which the pyinex module offers as pyinex.ExcelError. Call
-// once Python has started, before the functions below. False if Python failed.
+// once Python has started, before the functions below. False, with Python's error left set,
+// if Python failed.
 bool start_conversion();
 
 // The ExcelError class; a borrowed reference, null before start_conversion.

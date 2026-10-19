@@ -4,6 +4,86 @@ Versions from 2026 on are calendar versions, `YEAR.MONTH.N`: `2026.10.0` is the 
 release of October 2026, and `2026.10.1` the next one that month. Each month starts again
 at `.0`. A version heading with no date has not been released yet.
 
+## 2026.10.1 — October 19, 2026
+
+Functions a cell calls by their own names. Existing workbooks and scripts work unchanged:
+`PyCall` and the other functions behave as before.
+
+**Direct functions**
+
+- A function a script marks `@pyinex.func` becomes a worksheet function under its own
+  name: `=Discount(A1, B1)` instead of `=PyCall("model.py", "Discount", A1, B1)`. It
+  follows PyCall's rules for values, errors and threads.
+- Insert Function and the Function Arguments dialog show its argument names, from the
+  signature, and its help and each argument's help, from the docstring.
+  `@pyinex.func(name=..., category=..., help=...)` sets the name Excel uses, the category
+  (by default "Pyinex") and the help.
+- Any signature that fits 30 Excel arguments: positional parameters, then keyword-only
+  ones, then `*args`. An argument left out takes its default.
+- Annotations convert arguments: `int`, `float`, `str`, `bool`, a list of rows such as
+  `list[list[float]]`, `numpy.ndarray`, and any of these or `None`. A value that does not
+  fit gives `#VALUE!` and a console message naming the function, the argument and the
+  value. Text is never read as a number or a logical value.
+- A parameter annotated `pyinex.Range` receives a reference instead of its values, written
+  with Excel's own reference syntax. It gives its workbook, sheet, address, size and areas,
+  and during a call its values and which cells are empty. A whole column reads only its
+  used part.
+- Names are compared without regard to case. The first script to register a name keeps
+  it; a name another script, Excel or another add-in already uses is refused with a reason
+  on the console, as is one of Pyinex's own.
+- With `PyReloadOnChange` on, a changed function body takes effect at the next call, as
+  does any change Excel is not told of, such as a default value. A change to what Excel is
+  told (the number of arguments, their names or types, the help), a removed, renamed or
+  added function is registered or removed through Excel shortly after, and a removed name
+  no longer reaches another function.
+
+**Loading scripts**
+
+- `PyLoad(file)` loads a script at any time and registers its functions, in every open
+  workbook. It returns the number of functions it accepted, such as `2 functions`. A
+  script that fails to load registers nothing, and the next calculation of the cell loads
+  the fixed file.
+- `pyinex.ini` takes a `scripts` list, whose functions register when the add-in opens.
+  Python then starts when the add-in opens; otherwise it still starts at first use.
+- When a workbook opens, even in a new Excel, Pyinex calculates its `PyLoad` cells, on
+  hidden sheets too, so its functions register before anything changes. Entering those
+  cells again marks the workbook as changed.
+- A formula typed before its function was registered shows `#NAME?` until entered again.
+  Pyinex now enters such formulas again once the function registers, including calls
+  inside `IFERROR` and in `IF` branches not yet taken.
+- A new command, `PyRepair`, run from the Macro dialog or `Application.Run`, does both on
+  demand. It loads a workbook opened while a macro had turned Excel's events off, which
+  Pyinex cannot see opening.
+
+**Other changes**
+
+- Every function's last argument help shows whole in the Function Arguments dialog,
+  PyCall's included: Pyinex adds an empty one after it, as Microsoft advises.
+- When Excel answers that a cell a `pyinex.Range` reads is not yet calculated, the rest of
+  that call, a PyCall's included, makes no further call into Excel and gives `#VALUE!`, as
+  Microsoft requires; Excel calls the function again once the cell is calculated.
+- A new example workbook, `direct_functions.xlsx`, uses `PyLoad`, direct functions,
+  annotations and `pyinex.Range`.
+- The Python inside the add-in's core is kept as `.py` files and compiled into
+  `pyinex_core.dll` when it is built. The add-in is still two files.
+- A traceback no longer shows any of Pyinex's own frames, including one after the script's
+  own (as when `pyinex.ExcelError` refuses its text) and those of chained exceptions.
+- A relative script path in a workbook with no folder says why: no calling cell, as from a
+  macro, or a workbook opened from OneDrive or SharePoint, whose location is a web address.
+  It no longer claims the workbook was never saved.
+- `pyinex.ini` saved as UTF-16 big-endian is read; one saved as UTF-16 with no byte-order
+  mark is reported, rather than silently ignored.
+- A Python that fails to start is refused with Python's own reason, not the last line of
+  its thread dump; Python 2 is refused as too old. If Pyinex cannot set up a Python that
+  started, the console says which step failed and why, and that Excel must be restarted.
+- `PyConsole` refuses a position no monitor shows, as between monitors of different sizes.
+- The console no longer holds back the end of a line after a byte that is not UTF-8, and
+  keeps Pyinex's messages when Excel has standard output but no standard error.
+- A call Excel stopped, to calculate a cell it reads first, no longer prints a failure.
+- A result too large for memory gives `#VALUE!` with a console message.
+- Two script paths whose short hashes collide get modules of their own.
+- `PyInfo("pyinex")` does not start Python.
+
 ## 2026.10.0 — October 15, 2026
 
 A rewrite for current Excel and Python, and the first release since 0.83 alpha. Each

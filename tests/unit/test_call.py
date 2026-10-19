@@ -1,8 +1,13 @@
 """PyCall's argument rule and exception boundary (docs/architecture.md, "PyCall" and
 "Argument rule"), through the add-in's own code."""
 
+import os
+import re
+from pathlib import Path
+
 import pytest
 
+CORE_PYTHON = Path(__file__).resolve().parents[2] / "src" / "core" / "python"
 
 MISSING = ("missing",)
 NIL = ("nil",)
@@ -125,7 +130,11 @@ def test_exception_becomes_value_error(pycall, functions, capfd, name, shown):
     assert f"Pyinex: {name} in the script" in err
     assert "Traceback (most recent call last)" in err and shown in err
     assert "<pyinex>" not in err, "Pyinex's own frames are left out"
-    assert "functions.py" in err.split("Traceback (most recent call last)")[1]
+    # Every frame shown is the script's: none from the core's Python files, under any name
+    # they are compiled with (docs/architecture.md, "The core's Python files").
+    frames = re.findall(r'File "([^"]*)"', err.split("Traceback (most recent call last)")[1])
+    assert frames and {os.path.basename(f) for f in frames} == {"functions.py"}, frames
+    assert not any(p.name in err for p in CORE_PYTHON.glob("*.py")), err
     assert pycall(functions, "ok") == ("str", "still working")
 
 
@@ -183,3 +192,46 @@ def test_traceback_keeps_user_code_from_eval(pycall, script, capfd):
     assert pycall(path, "f") == VALUE_ERROR
     err = capfd.readouterr().err
     assert 'File "<string>"' in err and "ZeroDivisionError" in err
+
+
+def test_pyinex_s_own_frames_are_left_out_after_the_user_s_too(pycall, script, capfd):
+    # pyinex.ExcelError's constructor refuses the text in a frame of excel_error.py, after the
+    # user's; a chained exception's frames are filtered too.
+    path = script(
+        "import _pyinex_testing\n\n"
+        "def invalid():\n    return _pyinex_testing.ExcelError('invalid')\n\n"
+        "def chained():\n    try:\n        invalid()\n    except ValueError as e:\n"
+        "        raise RuntimeError('again') from e\n",
+        name="own_frames.py",
+    )
+    for function, shown in [("invalid", "ValueError: not an Excel error"), ("chained", "RuntimeError: again")]:
+        assert pycall(path, function) == VALUE_ERROR
+        err = capfd.readouterr().err
+        assert shown in err and "ValueError: not an Excel error" in err
+        frames = re.findall(r'File "([^"]*)"', err)
+        assert frames and {os.path.basename(f) for f in frames} == {"own_frames.py"}, err
+        assert "<pyinex/" not in err, err
+
+
+def test_a_traceback_keeps_a_cause_that_is_also_a_context(pycall, script, capfd):
+    # outer's cause is middle; root is both outer's context and middle's cause.
+    path = script(
+        "def shared():\n    root = KeyError('root')\n    middle = ValueError('middle')\n"
+        "    middle.__cause__ = root\n    outer = RuntimeError('outer')\n"
+        "    outer.__cause__ = middle\n    outer.__context__ = root\n    raise outer\n",
+        name="shared.py",
+    )
+    assert pycall(path, "shared") == VALUE_ERROR
+    err = capfd.readouterr().err
+    assert "KeyError: 'root'" in err and "ValueError: middle" in err and "RuntimeError: outer" in err, err
+
+
+def test_a_long_chain_of_causes_is_still_shown(pycall, script, capfd):
+    path = script(
+        "def chain():\n    error = ValueError(0)\n    for n in range(1, 1500):\n"
+        "        error, cause = ValueError(n), error\n        error.__cause__ = cause\n    raise error\n",
+        name="long_chain.py",
+    )
+    assert pycall(path, "chain") == VALUE_ERROR
+    err = capfd.readouterr().err
+    assert "ValueError: 1499" in err and "ValueError: 0" in err

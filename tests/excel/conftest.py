@@ -16,7 +16,9 @@ Excel embeds whichever Python the add-in chooses, not the one running pytest. Th
 picks it with a pyinex.ini beside the add-in and passes --excel-run, a folder holding
 expected.json (the Python it should be); the session checks Excel embedded that one before
 any test runs, and writes excel.json there (Excel's process id and start time, version and
-build) for the driver, which ends that Excel if it has not quit once pytest has exited.
+build) for the driver, which ends that Excel if it has not quit once pytest has exited. Each
+other Excel a test starts is reported the same way, in an "excel <name>.json" file
+(report_excel).
 """
 
 import ctypes
@@ -212,6 +214,18 @@ def rows_of(value):
     return [list(r) for r in value] if isinstance(value, tuple) else [[value]]
 
 
+def registered_types(app, xll):
+    """The numbered exports Excel has registered for the add-in xll, each with its type
+    string, read from Excel's registration table (Application.RegisteredFunctions: DLL,
+    procedure, type string). The reader is checked first against a registration known to be
+    there, PyCall's, so that an export it does not find is absent from the table, not missed
+    by the reader."""
+    rows = [(Path(dll).resolve(), procedure, type_) for dll, procedure, type_ in (app.RegisteredFunctions or ())]
+    mine = {procedure: type_ for dll, procedure, type_ in rows if dll == Path(xll).resolve()}
+    assert mine.get("PyCall") == "Q" * 33, f"the registration table's reader did not find PyCall's registration: {rows}"
+    return {procedure: type_ for procedure, type_ in mine.items() if procedure.startswith("PyFunc")}
+
+
 def same(got, expected):
     """A cell's value equals what was expected; floats to 12 significant figures."""
     if expected is None:
@@ -272,11 +286,82 @@ def _win32():
         pytest.skip("real-Excel tests need pywin32 (py -m pip install pywin32)")
 
 
+# Excel rejects a call from another process while it is busy, as it is while it runs a
+# macro such as Pyinex's queue command just after a workbook opens or a PyLoad cell
+# calculates (docs/architecture.md, "When a workbook opens"). With no message filter, COM
+# fails such a call at once (RPC_E_CALL_REJECTED), so the session registers one on its
+# thread, as Microsoft advises a program automating Excel to do: COM then tries a call
+# Excel asked to retry later every 100 ms, for up to a minute. pywin32 offers no
+# IMessageFilter, so it is made here with ctypes. Kept for the session, as COM holds it;
+# the filter the thread had before is put back when the session ends.
+_message_filter = []
+
+
+def _install_message_filter(pytestconfig):
+    from ctypes import POINTER, WINFUNCTYPE, byref, c_long, c_ulong, c_void_p
+    from ctypes.wintypes import DWORD
+
+    import pythoncom  # noqa: F401  Initializes COM on this thread, as a single-threaded apartment.
+
+    interfaces = {bytes.fromhex(f"{n:02x}000000" "0000" "0000" "c000000000000046") for n in (0x00, 0x16)}  # IUnknown, IMessageFilter
+    retry_later, handled, wait_default = 2, 0, 2  # SERVERCALL_RETRYLATER, SERVERCALL_ISHANDLED, PENDINGMSG_WAITDEFPROCESS
+
+    @WINFUNCTYPE(c_long, c_void_p, c_void_p, POINTER(c_void_p))
+    def query_interface(this, iid, out):
+        found = ctypes.string_at(iid, 16) in interfaces
+        out[0] = this if found else None
+        return 0 if found else -2147467262  # S_OK, E_NOINTERFACE
+
+    @WINFUNCTYPE(c_ulong, c_void_p)
+    def count(this):  # AddRef and Release: the filter lives as long as the process.
+        return 1
+
+    @WINFUNCTYPE(DWORD, c_void_p, DWORD, c_void_p, DWORD, c_void_p)
+    def handle_incoming_call(this, kind, caller, ticks, info):
+        return handled
+
+    @WINFUNCTYPE(DWORD, c_void_p, c_void_p, DWORD, DWORD)
+    def retry_rejected_call(this, callee, ticks, reject):
+        return 100 if reject == retry_later and ticks < 60_000 else 0xFFFFFFFF  # Wait 100 ms, or cancel.
+
+    @WINFUNCTYPE(DWORD, c_void_p, c_void_p, DWORD, DWORD)
+    def message_pending(this, callee, ticks, kind):
+        return wait_default
+
+    functions = (query_interface, count, count, handle_incoming_call, retry_rejected_call, message_pending)
+    vtable = (c_void_p * len(functions))(*(ctypes.cast(f, c_void_p) for f in functions))
+    instance = (c_void_p * 1)(ctypes.addressof(vtable))
+    register = ctypes.windll.ole32.CoRegisterMessageFilter
+    register.argtypes = [c_void_p, POINTER(c_void_p)]
+    previous = c_void_p()
+    if register(ctypes.addressof(instance), byref(previous)) != 0:
+        pytest.exit("cannot register a COM message filter", returncode=2)
+    _message_filter.extend([functions, vtable, instance])
+
+    def restore():
+        # COM takes its own reference to the filter put back, and releases this one's.
+        register(previous, None)
+        if previous:
+            release = WINFUNCTYPE(c_ulong, c_void_p)(ctypes.cast(previous, POINTER(POINTER(c_void_p)))[0][2])
+            release(previous)  # The reference CoRegisterMessageFilter handed back.
+
+    pytestconfig.add_cleanup(restore)  # After every session fixture, Excel's included.
+
+
 @pytest.fixture(scope="session")
 def run_folder(pytestconfig):
     """The driver's folder for this run, or None when pytest is run by hand."""
     folder = pytestconfig.getoption("--excel-run", default=None)
     return Path(folder) if folder else None
+
+
+def report_excel(run_folder, name, pid):
+    """Writes an Excel's process id and start time to "excel <name>.json" in the driver's
+    folder, so the driver waits for that Excel too once pytest has exited, and fails the run
+    if it has to end it (scripts/excel_tests.py). Nothing without the driver."""
+    if run_folder is not None:
+        report = {"pid": pid, "created": process_created(pid)}
+        (run_folder / f"excel {name}.json").write_text(json.dumps(report), "utf-8")
 
 
 @pytest.fixture(scope="session")
@@ -291,6 +376,7 @@ def expected(run_folder):
 def excel(pytestconfig, run_folder, expected):
     """A new Excel with the add-in loaded and Python started, ended after the session."""
     _win32()
+    _install_message_filter(pytestconfig)
     import pywintypes
     import win32process
     from win32com.client import DispatchEx
@@ -664,3 +750,87 @@ def cleared(app, console, mark):
     mark()
     app.Evaluate("PyConsole(FALSE, TRUE)")
     return console
+
+
+# An Excel of a test's own, for direct functions.
+
+
+class DirectExcel:
+    """An Excel of its own whose add-in, a copy in a folder of its own, lists
+    scripts/direct.py in its pyinex.ini, so the add-in registers direct.py's functions as it
+    opens (docs/architecture.md, "Direct functions")."""
+
+    def __init__(self, app, pid, xll):
+        self.app = app
+        self.pid = pid
+        self.xll = xll
+        self.folder = xll.parent
+        self.script = xll.parent / "direct.py"
+
+    def book(self, folder, sheet=None, name="book.xlsx"):
+        """A new workbook of one sheet, saved in folder."""
+        workbook = self.app.Workbooks.Add()
+        while workbook.Worksheets.Count > 1:
+            workbook.Worksheets(workbook.Worksheets.Count).Delete()
+        if sheet:
+            workbook.Worksheets(1).Name = sheet
+        workbook.SaveAs(str(folder / name), FileFormat=51)  # 51: .xlsx
+        return Book(self.app, workbook)
+
+    def pycall(self, function, *args):
+        """A PyCall formula calling the function in this add-in's direct.py, by full path."""
+        return pycall(str(self.script), function, *args)
+
+    def console(self, holding=None, timeout=5.0):
+        """Pyinex's console window in this Excel, waiting up to timeout for holding."""
+        deadline = time.monotonic() + timeout
+        while True:
+            window = Console.find(self.pid)
+            if window is not None and (holding is None or holding in window.text):
+                return window
+            if time.monotonic() > deadline:
+                return window
+            time.sleep(0.05)
+
+    def cleared(self):
+        """Clears the console once what was written before has arrived; returns this."""
+        marker = f"cleared {time.monotonic_ns()}"
+        self.app.Evaluate(f'PyCall("{self.script}", "PrintLater", "{marker}")')
+        window = self.console(holding=marker, timeout=10)
+        assert window is not None and marker in window.text, "the console never showed the marker"
+        self.app.Evaluate("PyConsole(FALSE, TRUE)")
+        return self
+
+
+@pytest.fixture(scope="session")
+def direct_excel(excel, embedded, pytestconfig, run_folder, tmp_path_factory):
+    """The DirectExcel of the session, started at first use and ended after the session.
+    Its pyinex.ini names the Python the session's Excel embedded."""
+    import pywintypes
+    import win32process
+    from win32com.client import DispatchEx
+
+    xll = Path(pytestconfig.getoption("--excel")).resolve()
+    folder = tmp_path_factory.mktemp("direct addin")
+    for source in (xll, xll.parent / "pyinex_core.dll", SCRIPTS / "direct.py", SCRIPTS / "values.py"):
+        shutil.copyfile(source, folder / source.name)
+    (folder / "pyinex.ini").write_text(f"[python]\nexecutable = {embedded['executable']}\nscripts = direct.py\n", "utf-8")
+    app = DispatchEx("Excel.Application")
+    pid = win32process.GetWindowThreadProcessId(app.Hwnd)[1]
+    report_excel(run_folder, "direct", pid)  # At once, so the driver can end it if the run hangs.
+    direct = DirectExcel(app, pid, folder / xll.name)
+    try:
+        app.Visible = True
+        app.DisplayAlerts = False
+        assert app.RegisterXLL(str(direct.xll)), f"Excel would not load {direct.xll}"
+        yield direct
+    finally:
+        try:
+            for workbook in list(app.Workbooks):
+                workbook.Close(SaveChanges=False)
+            app.Quit()
+        except pywintypes.com_error:
+            pass
+        direct.app = app = None
+        gc.collect()
+        # As for the session's Excel, the driver waits for this one after pytest has exited.

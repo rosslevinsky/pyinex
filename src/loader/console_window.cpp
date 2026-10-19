@@ -122,6 +122,19 @@ LRESULT CALLBACK window_procedure(HWND w, UINT message, WPARAM wparam, LPARAM lp
 // a new thread, on that heap, before the thread runs.
 HANDLE reader_started = nullptr;
 
+// How many bytes at the end of what was read begin a UTF-8 character the next read may
+// finish: a lead byte, with only continuation bytes after it, fewer than it needs. Anything
+// else goes now, valid or not, so a stray byte never holds back what follows it.
+size_t unfinished(const char* bytes, size_t n) {
+    for (size_t back = 1; back <= 3 && back <= n; ++back) {
+        const auto b = static_cast<unsigned char>(bytes[n - back]);
+        if ((b & 0xC0) == 0x80) continue;  // A continuation byte: its lead is further back.
+        const size_t needs = (b & 0xE0) == 0xC0 ? 2 : (b & 0xF0) == 0xE0 ? 3 : (b & 0xF8) == 0xF0 ? 4 : 0;
+        return back < needs ? back : 0;
+    }
+    return 0;
+}
+
 DWORD WINAPI read_output(void* pipe) {
     SetEvent(reader_started);
     constexpr DWORD chunk = 4096;
@@ -130,15 +143,9 @@ DWORD WINAPI read_output(void* pipe) {
     size_t kept = 0;
     for (DWORD got = 0; ReadFile(pipe, bytes + kept, chunk, &got, nullptr) && got > 0;) {
         const size_t n = kept + got;
-        // Only whole UTF-8 characters: one cut off at the end waits for the next read. Text
-        // that is not UTF-8 at all goes as it is, with replacement characters.
-        const auto whole = [&](size_t count) {
-            return count == 0 ||
-                   MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes, static_cast<int>(count), nullptr, 0) > 0;
-        };
-        size_t use = n;
-        while (use > 0 && n - use < 3 && !whole(use)) --use;
-        if (!whole(use)) use = n;
+        // A character cut off at the end waits for the next read. Text that is not UTF-8
+        // goes as it is, with replacement characters.
+        const size_t use = n - unfinished(bytes, n);
         const auto length = static_cast<size_t>(
             MultiByteToWideChar(CP_UTF8, 0, bytes, static_cast<int>(use), text, static_cast<int>(std::size(text))));
         kept = n - use;
@@ -162,7 +169,7 @@ DWORD WINAPI read_output(void* pipe) {
 // output (descriptor -2) when it starts, and Python asks the streams for their
 // descriptors, so the streams are reopened first, then their descriptors, and 1 and 2 for
 // code that writes to those directly, made copies of the pipe's.
-bool send_output_to(HANDLE pipe) {
+bool send_output_to(HANDLE pipe, bool out, bool err) {
     const HMODULE crt = LoadLibraryW(L"ucrtbase.dll");
     if (!crt) return false;
     const auto stream = reinterpret_cast<FILE*(__cdecl*)(unsigned)>(GetProcAddress(crt, "__acrt_iob_func"));
@@ -178,6 +185,7 @@ bool send_output_to(HANDLE pipe) {
     const int piped = open_handle(reinterpret_cast<intptr_t>(pipe), 0x8000 /* _O_BINARY */);
     if (piped < 0) return false;
     for (const auto [number, which] : {std::pair{1u, STD_OUTPUT_HANDLE}, std::pair{2u, STD_ERROR_HANDLE}}) {
+        if (!(number == 1 ? out : err)) continue;  // One the process has keeps it.
         FILE* reopened = nullptr;
         if (reopen(&reopened, L"NUL", L"w", stream(number)) != 0) continue;
         const int descriptor = descriptor_of(reopened);
@@ -189,8 +197,8 @@ bool send_output_to(HANDLE pipe) {
     return true;
 }
 
-// Makes the window, hidden, and if the process has no standard output, the pipe and
-// thread that bring it there.
+// Makes the window, hidden, and if the process lacks standard output or error, the pipe and
+// thread that bring what goes to either there.
 void make() {
     if (window) return;
     // The window's procedure and the reading thread are in this add-in.
@@ -216,8 +224,10 @@ void make() {
     SendMessageW(text_box, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
     dark_brush = CreateSolidBrush(dark_color);
     follow_app_mode();
-    // A process that already has output, as the fake Excel's is captured, keeps it.
-    if (usable(GetStdHandle(STD_OUTPUT_HANDLE))) return;
+    // A process that already has output, as the fake Excel's is captured, keeps it; one that
+    // has only one of the two gets the other.
+    const bool out = !usable(GetStdHandle(STD_OUTPUT_HANDLE)), err = !usable(GetStdHandle(STD_ERROR_HANDLE));
+    if (!out && !err) return;
     HANDLE read = nullptr, write = nullptr;
     if (!CreatePipe(&read, &write, nullptr, 1 << 16)) return;
     pending.reserve(most_text);
@@ -233,13 +243,13 @@ void make() {
     WaitForSingleObject(reader_started, INFINITE);
     CloseHandle(reader_started);
     CloseHandle(thread);
-    if (!send_output_to(write)) CloseHandle(write);  // The thread then ends.
+    if (!send_output_to(write, out, err)) CloseHandle(write);  // The thread then ends.
 }
 
 }  // namespace
 
 void prepare_output() {
-    if (!usable(GetStdHandle(STD_OUTPUT_HANDLE))) make();
+    if (!usable(GetStdHandle(STD_OUTPUT_HANDLE)) || !usable(GetStdHandle(STD_ERROR_HANDLE))) make();
 }
 
 void show_console(bool show, bool clear, const Placement& placement) {

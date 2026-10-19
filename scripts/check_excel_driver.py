@@ -6,12 +6,15 @@ Run at the signed-in, unlocked Windows desktop, with Excel closed, like the driv
 
 It runs the driver, under the newest Python only, on each deliberately bad test in
 tests/excel/driver_checks/: one that fails, one that skips, one whose PyCall never
-returns, and one that changes Windows' app mode and then makes such a call, both with a
-short timeout; and that last one again, stopped with Ctrl+C. Then it starts the driver
-with PYTHONPATH set, and with an Excel open, both of which it must refuse. After each it
-checks the driver's exit code and what it reported, that no Excel is left running, and
-that the settings the driver guards are as they were. It asks for no input, and exits 0
-only if every check passed.
+returns, one that leaves a second Excel of its own running, and one that changes Windows'
+app mode and then makes such a call, the hanging ones with a short timeout; and that last
+one again, stopped with Ctrl+C. The one that fails and the one that leaves an Excel also
+run with a second run asked for: the driver carries on after failed tests, stops after an
+Excel it had to end, and with --keep-going carries on after that too. Then it starts the
+driver with PYTHONPATH set, and with an Excel open, both of which it must refuse. After
+each it checks the driver's exit code and what it reported, that no Excel is left running,
+and that the settings the driver guards are as they were. It asks for no input, and exits
+0 only if every check passed.
 """
 
 import argparse
@@ -102,7 +105,7 @@ def main():
     results = Path(tempfile.mkdtemp(prefix="pyinex-driver-checks-"))
     outcomes = []
 
-    def check(name, run, expected_code, expected_text):
+    def check(name, run, expected_code, expected_text, runs=None):
         settings, light = driver.record(driver.SETTINGS), mode()
         print(f"\n##### {name}", flush=True)
         code, output, summary = run(results / name)
@@ -113,6 +116,8 @@ def main():
             wrong.append(f"did not report {expected_text!r}")
         if expected_code != 2 and summary is None:
             wrong.append("wrote no summary.json")
+        if runs is not None and summary is not None and len(summary["runs"]) != runs:
+            wrong.append(f"{len(summary['runs'])} runs, expected {runs}")
         if driver.excel_running():
             wrong.append("an Excel is still running")
         if mode() != light:
@@ -127,6 +132,14 @@ def main():
     check("fails", tests("test_fails.py"), 1, "pytest exited 1")
     check("skips", tests("test_skips.py"), 1, "skipped: a run that did not test everything")
     check("hangs", tests("test_hangs.py", "--timeout", "60"), 1, "reached its timeout")
+    check("second Excel left", tests("test_leaves_a_second_excel.py"), 1, "Excel had to be ended")
+    # Of two runs asked for: failed tests run the second; an Excel ended stops before it,
+    # unless --keep-going.
+    check("fails, two runs", tests("test_fails.py", "--python", driver.VENV), 1, "pytest exited 1", runs=2)
+    check("second Excel left, two runs", tests("test_leaves_a_second_excel.py", "--python", driver.VENV), 1,
+          "stopped after", runs=1)
+    check("second Excel left, keep going", tests("test_leaves_a_second_excel.py", "--python", driver.VENV, "--keep-going"),
+          1, "Excel had to be ended", runs=2)
     check("changes mode, timeout", tests("test_changes_mode_then_hangs.py", "--timeout", "60"), 1, "reached its timeout")
     light = mode()
     check("changes mode, Ctrl+C", tests("test_changes_mode_then_hangs.py", "--timeout", "600", stop_when=lambda: mode() != light), 130, "stopped with Ctrl+C")

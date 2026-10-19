@@ -214,3 +214,30 @@ def test_functions_run_once_the_wizard_closes(host):
     assert host.call("PyInfo", "status") == ""
     host.set_wizard(False)
     assert host.call("PyInfo", "status") == "running"
+
+
+
+def test_a_relative_path_with_no_calling_cell_says_so(host):
+    # As from a macro's Application.Run: there is no workbook, not an unsaved one.
+    host.set_caller(None)
+    assert host.call("PyCall", "rel.py", "f") == Err(VALUE)
+    said = wait_for(host, "cannot find the script rel.py")
+    assert "this call does not come from a cell, so it has no workbook; give the script's full path instead" in said
+    assert "has not been saved" not in said
+
+
+def test_a_workbook_stored_on_the_web_says_a_relative_path_needs_a_folder(host):
+    # A workbook opened from OneDrive or SharePoint has a web address, not a folder.
+    host.set_folder("https://d.docs.live.net/abc123/Documents")
+    assert host.call("PyCall", "rel.py", "f") == Err(VALUE)
+    said = wait_for(host, "cannot find the script rel.py")
+    assert "this workbook is stored on the web, at https://d.docs.live.net/abc123/Documents" in said
+    assert "has not been saved" not in said
+
+
+def test_a_result_too_large_for_memory_says_so(host, tmp_path):
+    # A whole sheet of numbers: Python holds it as one row repeated, Excel would need every cell.
+    path = tmp_path / "huge.py"
+    path.write_text("def f():\n    row = (0.0,) * 16384\n    return (row,) * 1048576\n", encoding="utf-8")
+    assert host.call("PyCall", str(path), "f") == Err(VALUE)
+    assert "memory ran out while converting the result for Excel" in wait_for(host, "memory ran out")

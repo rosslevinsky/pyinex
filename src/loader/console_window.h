@@ -6,9 +6,9 @@
 
 namespace pyinex::loader {
 
-// Called before Python starts. When the process has no standard output, as in Excel,
-// makes the window and points the standard handles and the C runtime's output at it, so
-// Python's sys.stdout and sys.stderr, and C code's printf, write to it.
+// Called before Python starts. When the process has no standard output or error, as in
+// Excel, makes the window and points the standard handles it lacks, and the C runtime's
+// output, at it, so Python's sys.stdout and sys.stderr, and C code's printf, write to it.
 void prepare_output();
 
 struct Placement {

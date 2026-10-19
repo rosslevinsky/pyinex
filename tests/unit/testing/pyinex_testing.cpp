@@ -1,15 +1,21 @@
 // _pyinex_testing: the add-in's value conversion and column letters as a Python extension
 // module, so tests/unit can test them without Excel. It is compiled from the same sources
-// as pyinex_core.dll. tests/unit/conftest.py describes how values are passed in and out.
+// as pyinex_core.dll, and holds the core's Python files as the core does (sources).
+// tests/unit/conftest.py describes how values are passed in and out.
 #include "core/call.h"
 #include "core/convert.h"
 #include "core/py.h"
+#include "core/python/bootstrap.py.h"
+#include "core/python/call.py.h"
+#include "core/python/excel_error.py.h"
+#include "core/python/funcs.py.h"
 #include "excel/address.h"
 #include "excel/excel.h"
 
 #include <deque>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace pyinex;
@@ -239,5 +245,14 @@ PyMODINIT_FUNC PyInit__pyinex_testing() {
     }
     Ref m(PyModule_Create(&module));
     if (!m.get() || PyModule_AddObjectRef(m.get(), "ExcelError", core::excel_error_type()) < 0) return nullptr;
+    // sources: each of the core's Python files, by name, as the build compiled it in.
+    Ref sources(PyDict_New());
+    if (!sources.get()) return nullptr;
+    for (auto [name, text] : {std::pair{"bootstrap.py", core::python::bootstrap_py}, {"call.py", core::python::call_py},
+                              {"excel_error.py", core::python::excel_error_py}, {"funcs.py", core::python::funcs_py}}) {
+        Ref value(PyUnicode_FromString(text));
+        if (!value.get() || PyDict_SetItemString(sources.get(), name, value.get()) < 0) return nullptr;
+    }
+    if (PyModule_AddObjectRef(m.get(), "sources", sources.get()) < 0) return nullptr;
     return m.release();
 }

@@ -10,6 +10,7 @@ five runs under five Pythons test five Pythons. Discovery tests change this on p
 """
 
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -124,3 +125,33 @@ def bad_host(xllhost, bad_xll):
     with Host(xllhost, bad_xll, env=host_env()) as h:
         h.open()
         yield h
+
+
+@pytest.fixture
+def startup(xllhost, pyinex_xll, tmp_path):
+    """startup(listed, before=None, **files): a fake Excel with a copy of the add-in open, in
+    a folder of its own whose pyinex.ini lists the scripts given as listed, the scripts key's
+    text; each of files, by name, is written into that folder first, and before, given, is
+    called with the host just before the add-in opens."""
+    from hostdriver import Host
+
+    hosts = []
+
+    def start(listed, before=None, **files):
+        folder = tmp_path / "addin"
+        folder.mkdir(exist_ok=True)
+        for name in ("pyinex.xll", "pyinex_core.dll"):
+            shutil.copy2(pyinex_xll.parent / name, folder / name)
+        for name, text in files.items():
+            (folder / name).write_text(text, encoding="utf-8")
+        (folder / "pyinex.ini").write_text(f"[python]\nscripts = {listed}\n", encoding="utf-8")
+        h = Host(xllhost, folder / "pyinex.xll", env=host_env())
+        hosts.append(h)
+        if before:
+            before(h)
+        h.open()
+        return h
+
+    yield start
+    for h in hosts:
+        h.quit()

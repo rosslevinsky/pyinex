@@ -1,9 +1,10 @@
 // The add-in's entry points: what Excel calls when it opens and closes the add-in, frees a
 // returned value, or calculates one of Pyinex's worksheet functions (docs/architecture.md,
-// "Excel functions").
+// "Excel functions"). The two commands, PyRepair and the queue's, are in functions.cpp.
 #include "console/console.h"
 #include "excel/excel.h"
 #include "loader/console_window.h"
+#include "loader/functions.h"
 #include "loader/python.h"
 
 #include <cmath>
@@ -14,14 +15,13 @@
 
 using namespace pyinex::excel;
 using pyinex::loader::python;
+using pyinex::loader::reload_on_change;
 
 #define PYINEX_EXPORT extern "C" __declspec(dllexport)
 
 namespace {
 
 constexpr int max_arguments = 30;  // PyCall's, after the file and the function.
-
-bool reload_on_change = true;
 
 std::vector<std::wstring_view> pycall_help() {
     std::vector<std::wstring_view> help = {L"Path of the Python script; a relative path is relative to the workbook's folder.",
@@ -61,6 +61,12 @@ const Function functions[] = {
      .help = L"Reports which Python and which add-in are loaded.",
      .argument_help = {L"status, python, pyinex, version, executable, prefix, venv or addin_version; "
                        L"leave out for all of them."}},
+    {.name = L"PyLoad",
+     .procedure = L"PyLoad",
+     .type = L"QQ",
+     .arguments = L"file",
+     .help = L"Loads a Python script and registers the functions it marks @pyinex.func. Returns how many.",
+     .argument_help = {L"Path of the Python script; a relative path is relative to the workbook's folder."}},
 };
 
 int type_of(const XLOPER12& x) { return x.xltype & ~(xlbitDLLFree | xlbitXLFree); }
@@ -92,15 +98,11 @@ std::wstring check_placement(const pyinex::loader::Placement& p) {
     if (p.width.has_value() != p.height.has_value()) return L"PyConsole: give width and height together, or neither";
     if (p.width && (*p.width < 1 || *p.height < 1))
         return L"PyConsole: width and height must be more than 0 pixels, after rounding to whole pixels";
-    if (p.x) {
-        // The desktop spans every monitor, so it can start left of or above the main one.
-        const int left = GetSystemMetrics(SM_XVIRTUALSCREEN), top = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        const int right = left + GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1;
-        const int bottom = top + GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1;
-        if (*p.x < left || *p.x > right || *p.y < top || *p.y > bottom)
-            return L"PyConsole: x and y must lie on the desktop, from " + std::to_wstring(left) + L"," +
-                   std::to_wstring(top) + L" to " + std::to_wstring(right) + L"," + std::to_wstring(bottom);
-    }
+    // On a monitor, not merely within the rectangle round them all, whose corners monitors of
+    // different sizes leave bare. A monitor left of or above the main one has negative x or y.
+    if (p.x && !MonitorFromPoint({*p.x, *p.y}, MONITOR_DEFAULTTONULL))
+        return L"PyConsole: x and y must lie on a monitor; " + std::to_wstring(*p.x) + L"," + std::to_wstring(*p.y) +
+               L" is on none";
     return L"";
 }
 
@@ -115,10 +117,8 @@ Value info_item(std::wstring_view item, const pyinex::loader::Core* core) {
     if (item == L"python") return Value::text(core->dll);
     if (item == L"executable") return Value::text(core->executable);
     if (item == L"addin_version") return Value::text(PYINEX_VERSION);
-    LPXLOPER12 known = core->info(std::wstring(item).c_str());  // version, prefix, venv.
-    Value value = Value::copy(*known);
-    if (known->xltype & xlbitDLLFree) free_returned(known);  // Not guarded's static error.
-    return value;
+    const Returned known(core->info(std::wstring(item).c_str()));  // version, prefix, venv.
+    return Value::copy(*known.get());
 }
 
 }  // namespace
@@ -126,7 +126,14 @@ Value info_item(std::wstring_view item, const pyinex::loader::Core* core) {
 PYINEX_EXPORT int xlAutoOpen() {
     try {
         pyinex::loader::forget_refusal();
-        register_functions(functions);
+        std::wstring refused;
+        for (const auto& f : functions)
+            if (!register_function(f)) refused += (refused.empty() ? L"" : L", ") + std::wstring(f.name);
+        if (!refused.empty()) {
+            pyinex::loader::prepare_output();  // In Excel, there is nowhere to say it until then.
+            pyinex::console::note(L"Excel refused to register " + refused + L"; close and open the add-in again");
+        }
+        pyinex::loader::open_functions();
         return 1;
     } catch (...) {
         return 0;
@@ -134,10 +141,28 @@ PYINEX_EXPORT int xlAutoOpen() {
 }
 
 // Python keeps running, and the add-in stays loaded once it has started (docs/architecture.md,
-// "Lifetime").
+// "Lifetime"), but the direct functions are removed and their names cleared, and queued to
+// come back if Excel carries on.
 PYINEX_EXPORT int xlAutoClose() {
+    try {
+        pyinex::loader::close_functions();
+    } catch (...) {
+    }
     if (const auto* core = pyinex::loader::running()) core->close();
     return 1;
+}
+
+// The command unregister_function registers under a name to clear it; never run. Excel also
+// calls it when the add-in is removed in its Add-ins dialog.
+PYINEX_EXPORT int xlAutoRemove() { return 1; }
+
+// Windows unloading the add-in (reserved null: not at the process's exit), as it does after
+// xlAutoClose when nothing has pinned the add-in: the queue's timer, kept after xlAutoClose in
+// case Excel carries on, would otherwise call code no longer there (docs/architecture.md,
+// "Lifetime"). Only Windows' own window functions run here, never Python.
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved) {
+    if (reason == DLL_PROCESS_DETACH && !reserved) pyinex::loader::unload_functions();
+    return TRUE;
 }
 
 PYINEX_EXPORT void xlAutoFree12(LPXLOPER12 x) { free_returned(x); }
@@ -156,7 +181,9 @@ PYINEX_EXPORT LPXLOPER12 PyCall(LPXLOPER12 file, LPXLOPER12 function, LPXLOPER12
         const XLOPER12* const args[max_arguments] = {a1,  a2,  a3,  a4,  a5,  a6,  a7,  a8,  a9,  a10,
                                                      a11, a12, a13, a14, a15, a16, a17, a18, a19, a20,
                                                      a21, a22, a23, a24, a25, a26, a27, a28, a29, a30};
-        return core->call(file, function, args, max_arguments, reload_on_change);
+        Returned result(core->call(file, function, args, max_arguments, reload_on_change));
+        pyinex::loader::take_changes(*core);  // The script may be one PyLoad loaded, changed.
+        return result.release();
     });
 }
 
@@ -188,10 +215,22 @@ PYINEX_EXPORT LPXLOPER12 PyReloadOnChange(LPXLOPER12 on) {
     });
 }
 
+PYINEX_EXPORT LPXLOPER12 PyLoad(LPXLOPER12 file) {
+    return guarded([&] {
+        if (in_function_wizard()) return blank();
+        const auto* core = python();
+        return core ? pyinex::loader::load(*core, *file) : Value::error(xlerrValue).to_excel();
+    });
+}
+
 PYINEX_EXPORT LPXLOPER12 PyInfo(LPXLOPER12 item) {
     return guarded([&] {
         if (in_function_wizard()) return blank();
-        const auto* core = python();  // Every item starts Python.
+        // The add-in's path needs no Python: the queue asks for it, after a close, to see whether
+        // Excel unloaded the add-in, which must not start Python where nothing used it.
+        if (type_of(*item) == xltypeStr && CompareStringOrdinal(item->val.str + 1, item->val.str[0], L"pyinex", -1, TRUE) == CSTR_EQUAL)
+            return info_item(L"pyinex", nullptr).to_excel();
+        const auto* core = python();  // Every other item starts Python.
         if (!given(*item)) {
             std::vector<Value> table;
             for (const auto name : info_items) {

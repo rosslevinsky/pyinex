@@ -36,7 +36,7 @@ Before pushing, also run `python scripts/count_lines.py` (the C++ budget) and
 | Path | What it holds |
 |---|---|
 | `src/loader/` | `pyinex.xll`, the DLL Excel loads: entry points, the four functions, choosing a Python, the console window. Links no Python. |
-| `src/core/` | `pyinex_core.dll`: starting Python, PyCall's calls and script cache (`call.cpp`), value conversion (`convert.cpp`), the `pyinex` module (`module.cpp`). Uses only the 3.10 stable ABI. |
+| `src/core/` | `pyinex_core.dll`: starting Python, PyCall's calls and script cache (`call.cpp`), value conversion (`convert.cpp`), the `pyinex` module (`module.cpp`). Uses only the 3.10 stable ABI. Its Python is in `src/core/python/`, compiled in by the build (`cmake/EmbedPython.cmake`). |
 | `src/excel/` | The thin wrapper over Microsoft's Excel SDK: values, registration, calling Excel, column letters. |
 | `src/console/`, `src/common/` | Writing `Pyinex:` messages; environment variables in both Windows' and the C runtime's copies. |
 | `cmake/ExcelSdk.cmake`, `sdk/README.md` | Fetching Microsoft's SDK at configure time. Its files are never committed. |
@@ -56,7 +56,7 @@ Before pushing, also run `python scripts/count_lines.py` (the C++ budget) and
   code. A defect fix comes with a test that failed before it.
 - **C++:** C++20, MSVC, `/W4 /WX`. The core compiles against the newest Python's headers
   with `Py_LIMITED_API=0x030A0000`: no API newer than 3.10's stable ABI, and nothing
-  deprecated. Pyinex's own C++ under `src/` stays under 2,500 counted lines
+  deprecated. Pyinex's own C++ under `src/` stays under 3,000 counted lines
   (`scripts/count_lines.py`).
 - **Never call Python** from `DllMain`, a static object's constructor or destructor, or a
   thread Excel did not call in on. Never finalize Python.

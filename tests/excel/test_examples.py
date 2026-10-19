@@ -4,14 +4,24 @@ Every formula on every sheet is a check: the cells just to the right of its resu
 the value it should show (scripts/make_examples.py); for a formula entered into a range of
 cells, the expected block of the same size sits just to its right. tests/unit/test_examples.py
 checks the workbooks' shape without Excel.
+
+direct_functions.xlsx loads its script with PyLoad, so its direct functions register a
+moment after the workbook opens (docs/architecture.md, "When a workbook opens"); its cells
+are read once none shows #NAME?.
 """
 
-import pytest
+import time
 
-from conftest import ROOT, rows_of, same, shown
+import pytest
+from conftest import ROOT, E, rows_of, same, shown
 
 WORKBOOKS = sorted(p.name for p in (ROOT / "examples").glob("*.xlsx"))
 PRINTED = "Hello from Python, Excel."  # What examples/addin.py prints.
+
+
+def shows_name_error(workbook):
+    """Whether any cell of the workbook shows #NAME?."""
+    return any(shown(v) == E("#NAME?") for sheet in workbook.Worksheets for row in rows_of(sheet.UsedRange.Value2) for v in row)
 
 
 def check(app, path):
@@ -20,6 +30,9 @@ def check(app, path):
     workbook = app.Workbooks.Open(str(path), ReadOnly=True)
     try:
         app.CalculateFull()
+        deadline = time.monotonic() + 20
+        while shows_name_error(workbook) and time.monotonic() < deadline:
+            time.sleep(0.1)
         for sheet in workbook.Worksheets:
             used = sheet.UsedRange
             for r in range(used.Row, used.Row + used.Rows.Count):

@@ -5,7 +5,7 @@ commit the add-in was built from, under a Python with pytest and pywin32:
 
     py -3.14 scripts\\excel_tests.py C:\\path\\to\\pyinex.xll [--out FOLDER]
         [--python 3.12 --python venv ...] [--tests tests\\excel\\test_examples.py ...]
-        [--timeout SECONDS]
+        [--timeout SECONDS] [--keep-going]
 
 For each of Python 3.10-3.15, a virtual environment made from 3.15, and another in a
 folder whose name holds spaces and Unicode (or only the runs given with --python), it
@@ -18,7 +18,11 @@ the tests marked for it. It asks for no input and opens no window that waits for
 
 A run passes only if every test passed: a failure, an error, a skipped test, no tests, a
 run that reached its timeout, an Excel that had to be ended, or a setting that could not
-be put back each fail it. The driver exits 0 only if every run passed.
+be put back each fail it. The driver exits 0 only if every run passed. A run whose Excel
+had to be ended, that reached its timeout, or in which no tests ran stops the driver there,
+since the runs left would almost always meet the same: the add-in or the machine, not one
+Python, is at fault. Failed tests do not stop it, since which Pythons they fail under says
+something of why. --keep-going runs the rest whatever happens.
 
 It records the settings the tests may change (Windows' app mode, Excel's options and the
 add-ins it loads at start-up) before each run, and puts back and checks them after, even
@@ -310,16 +314,28 @@ def excel_report(folder):
         return {}
 
 
-def excel_process(folder):
-    """A handle to the Excel the session reported, or None: only while its pid is still that
+def excel_process(path):
+    """A handle to the Excel a report names, or None: only while its pid is still that
     Excel, the process started when the session says, so once pytest has exited and Excel
     with it, another process given the same pid is never taken for it."""
-    report = excel_report(folder)
+    try:
+        report = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
     handle = open_process(report["pid"]) if "pid" in report else None
     if handle and (report.get("created") is None or created(handle) != report["created"]):
         ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(handle))
         return None
     return handle
+
+
+def take_excels(folder, excels):
+    """Adds to excels, by report, a handle to each Excel the session has reported and not yet
+    taken: its own (excel.json) and any other a test started ("excel <name>.json"). A report
+    whose Excel was ended maps to None, so it is not taken again."""
+    for path in folder.glob("excel*.json"):
+        if path.name not in excels and (handle := excel_process(path)):
+            excels[path.name] = handle
 
 
 def run_one(name, python, args, xll, temp, out, log):
@@ -374,10 +390,10 @@ def run_one(name, python, args, xll, temp, out, log):
     reader = threading.Thread(target=lambda: [log(line.rstrip("\n")) for line in process.stdout], daemon=True)
     reader.start()
     interrupted = timed_out = forced = False
-    excel = None  # A handle to the session's Excel, taken as soon as it reports its pid.
+    excels = {}  # Handles to the session's Excels, each taken as soon as it is reported.
     try:
         while process.poll() is None:
-            excel = excel or excel_process(folder)
+            take_excels(folder, excels)
             if time.monotonic() - started > args.timeout:
                 timed_out = True
                 log(f"{name}: no result after {args.timeout} seconds; ending its Excel")
@@ -390,12 +406,13 @@ def run_one(name, python, args, xll, temp, out, log):
         if interrupted:
             log(f"{name}: stopped (Ctrl+C); ending its Excel and putting settings back")
         if timed_out or interrupted:
-            deadline, ended = time.monotonic() + 60, False
+            deadline = time.monotonic() + 60
             while process.poll() is None and time.monotonic() < deadline:
-                excel = excel or (None if ended else excel_process(folder))
-                if excel:
-                    forced |= end_process(excel, 0)
-                    excel, ended = None, True
+                take_excels(folder, excels)
+                for report, excel in excels.items():
+                    if excel:
+                        forced |= end_process(excel, 0)
+                        excels[report] = None
                 time.sleep(0.5)
             if process.poll() is None:
                 process.kill()
@@ -403,12 +420,13 @@ def run_one(name, python, args, xll, temp, out, log):
         process.wait()
         reader.join(10)
         # A short run can start and quit its Excel between two looks, and Ctrl+C can come
-        # before the first: take it now if it is still running.
-        excel = excel or excel_process(folder)
+        # before the first: take each now if it is still running.
+        take_excels(folder, excels)
         # Excel quits once pytest, which held it, has exited. It sometimes takes a minute,
-        # with no add-in loaded as with one (seen in testing), so it gets 90 seconds.
-        if excel and end_process(excel, 90):
-            forced = True
+        # with no add-in loaded as with one (seen in testing), so each gets 90 seconds.
+        for excel in excels.values():
+            if excel and end_process(excel, 90):
+                forced = True
         if excel_running():
             problems.append("an Excel is still running that the driver could not end: close it, then check the settings, which it may change as it quits; no further runs")
             result["excel_left"] = True
@@ -436,6 +454,8 @@ def run_one(name, python, args, xll, temp, out, log):
         problems.append(f"reached its timeout ({args.timeout} seconds)")
     if forced:
         problems.append("Excel had to be ended")
+    # What the runs left would meet too, whatever their Python (the module's docstring).
+    result["stops"] = forced or timed_out or counts["tests"] == 0
     if interrupted:
         problems.append("stopped with Ctrl+C")
         result["interrupted"] = True
@@ -467,6 +487,8 @@ def main():
     parser.add_argument("--python", action="append", choices=RUNS, metavar="RUN", help=f"run only these (repeatable): {', '.join(RUNS)}")
     parser.add_argument("--tests", nargs="+", default=["tests/excel"], help="what pytest runs (default: tests/excel)")
     parser.add_argument("--timeout", type=int, default=3600, help="seconds each run may take (default: 3600)")
+    parser.add_argument("--keep-going", action="store_true",
+                        help="run the rest after a run whose Excel had to be ended, that reached its timeout, or in which no tests ran")
     args = parser.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
     xll = args.xll.resolve()
@@ -503,6 +525,10 @@ def main():
                 raise KeyboardInterrupt
             if result.get("excel_left"):
                 break
+            if result.get("stops") and not args.keep_going:
+                summary["stopped"] = name
+                log(f"\n{name}: stopping here, since the runs left would almost always fail the same way; --keep-going runs them")
+                break
     except KeyboardInterrupt:
         summary["stopped"] = "Ctrl+C"
         code = 130
@@ -516,6 +542,8 @@ def main():
             log(f"{'ok  ' if not r['problems'] else 'FAIL'}  {r['run']:<5} {counts}" + "".join(f"\n        {p}" for p in r["problems"]))
         if code == 130:
             log("stopped with Ctrl+C before every run finished: not a pass")
+        elif summary.get("stopped"):
+            log(f"stopped after {summary['stopped']}, before every run finished: not a pass")
         elif code == 0 and len(summary["runs"]) == len(args.python or RUNS):
             log("every run passed")
         shutil.rmtree(temp, ignore_errors=True)

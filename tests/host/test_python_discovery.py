@@ -16,6 +16,7 @@ import _winapi
 import pytest
 
 from conftest import evaluate, host_env
+from test_calls import wait_for
 from hostdriver import VALUE, Err, Host
 from test_embedded_python import embedded_state, started_as
 
@@ -553,3 +554,44 @@ def test_pythonpath_naming_the_host_folder_keeps_it(start, tmp_path, xllhost, py
     finally:
         for h in hosts:
             h.quit()
+
+
+
+def test_ini_saved_as_utf16_big_endian_is_read(start, addin_copy, tmp_path):
+    link = tmp_path / "Bücher ✓ 😀"
+    subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(BASE.parent)], check=True, capture_output=True)
+    text = f"[python]\nexecutable = {link / BASE.name}\n"
+    (addin_copy.parent / "pyinex.ini").write_bytes(b"\xfe\xff" + text.encode("utf-16-be"))
+    h = start(addin_copy)
+    assert executable(h) == same(link / BASE.name)
+
+
+def test_ini_in_utf16_with_no_byte_order_mark_is_reported(start, addin_copy, tmp_path):
+    # Nothing tells it from 8-bit text: the console says how to save it, and PATH chooses.
+    text = f"[python]\nexecutable = {tmp_path / 'missing' / 'python.exe'}\n"
+    (addin_copy.parent / "pyinex.ini").write_bytes(text.encode("utf-16-le"))
+    h = start(addin_copy, PATH=f"{BASE.parent};{SYSTEM_PATH}")
+    assert executable(h) == same(BASE)
+    assert "save it as UTF-8, or as UTF-16 with a byte-order mark" in wait_for(h, "byte-order mark")
+
+
+def test_a_python_that_cannot_start_gives_its_own_reason_not_its_thread_dump(start, tmp_path, fakepython):
+    output = ("Python path configuration:|  sys.path = []|Fatal Python error: Failed to import encodings module|"
+              "Python runtime state: core initialized|ModuleNotFoundError: No module named 'encodings'||"
+              "Current thread 0x0000000207606240 (most recent call first):|  <no Python frame>")
+    exe = fake(tmp_path, fakepython)
+    h = start(PYINEX_PYTHON=str(exe), FAKEPYTHON_OUTPUT=output, FAKEPYTHON_EXIT="1")
+    assert_refused(h, f"cannot use Python {exe}: it failed to start (exit code 1): Fatal Python error: Failed to "
+                      "import encodings module (ModuleNotFoundError: No module named 'encodings')")
+
+
+def test_a_set_up_python_cannot_finish_says_why_and_to_restart_excel(start, tmp_path):
+    # A module Pyinex's own code imports, shadowed on PYTHONPATH by one that raises.
+    shadow = tmp_path / "shadow"
+    shadow.mkdir()
+    (shadow / "typing.py").write_text("raise RuntimeError('shadowed typing')\n", encoding="utf-8")
+    h = start(PYINEX_PYTHON=str(BASE), PYTHONPATH=str(shadow))
+    assert h.call("PyInfo", "status").startswith("Python started, but Pyinex could not set it up; the console says why")
+    said = wait_for(h, "restart Excel")
+    assert "could not set it up: " in said and "RuntimeError: shadowed typing" in said
+    assert "restart Excel" in said

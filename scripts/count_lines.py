@@ -11,7 +11,7 @@ import re
 import sys
 from pathlib import Path
 
-BUDGET = 2500
+BUDGET = 3000
 ROOT = Path(__file__).resolve().parent.parent
 
 

@@ -194,7 +194,32 @@ ADDIN = [
     )
 ]
 
-WORKBOOKS = {"basics": BASICS, "ranges": RANGES, "pyinex_module": MODULE, "addin": ADDIN}
+DIRECT = [
+    Sheet(
+        "Direct functions",
+        "Functions called by their own names",
+        "PyLoad loads direct_functions.py, beside this workbook, and registers each function it marks "
+        "@pyinex.func under its own name. Pyinex loads it again when the workbook opens.",
+        inputs=[("G4", "Column H:", "H4", [[10], [20], [None], [40]])],
+        checks=[
+            Check("PyLoad gives the number of functions", 'PyLoad("direct_functions.py")', "6 functions"),
+            Check("A function called by its name", "Discount(100,0.1)", 90),
+            Check("... is the function PyCall calls", 'PyCall("direct_functions.py","Discount",100,0.1)', 90),
+            Check("A name given by the decorator", "CompoundGrowth(1000,0.05,2)", 1102.5),
+            Check("A default for an argument left out", "CompoundGrowth(1000,0.05)", 1050),
+            Check("An int annotation refuses a fraction", "CompoundGrowth(1000,0.05,2.5)", "#VALUE!"),
+            Check("A float annotation refuses text", 'CompoundGrowth("1000",0.05)', "#VALUE!"),
+            Check("*args takes any number of values", "Total(1,2,3)", 6),
+            Check("... or none", "Total()", 0),
+            Check("A pyinex.Range gives its address", "Where(H4:H7)", "[direct_functions.xlsx]Direct functions!H4:H7"),
+            Check("A whole column reads only its used part", "UsedRows(H:H)", 7),
+            Check("... and tells empty cells apart", "FilledCells(H:H)", 3),
+            Check("A pyinex.Range refuses a value", "FilledCells(5)", "#VALUE!"),
+        ],
+    )
+]
+
+WORKBOOKS = {"basics": BASICS, "ranges": RANGES, "pyinex_module": MODULE, "addin": ADDIN, "direct_functions": DIRECT}
 
 
 def write_sheet(ws, sheet):

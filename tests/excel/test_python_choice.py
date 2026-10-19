@@ -116,10 +116,15 @@ def test_pyconsole_works_before_python_starts(excel, pid, expected):
 
 @pytest.mark.kind("first_call")
 def test_any_pyinfo_item_asked_first_starts_python(excel, pid, expected):
+    # All but the add-in's path, which the queue asks for after a close, and which must not
+    # start Python where nothing used it.
     item = expected["first"]
     assert python_dlls(pid) == []
     got = evaluate(excel, f'PyInfo("{item}")')
     assert not isinstance(got, E), f"PyInfo({item!r}) gave {got}"
+    if item == "pyinex":
+        assert python_dlls(pid) == [], "PyInfo('pyinex') started Python"
+        assert evaluate(excel, 'PyInfo("status")') == "running"
     assert python_dlls(pid), f"PyInfo({item!r}) did not start Python"
     # What the first call gave is what the item is once Python runs.
     again = evaluate(excel, f'PyInfo("{item}")')

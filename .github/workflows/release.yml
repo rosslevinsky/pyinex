@@ -1,6 +1,6 @@
 # On a version tag (v2026.10.0), builds Pyinex, runs the tests that need no Excel, and
 # publishes a GitHub release: the add-in as a zip, with that version's CHANGELOG.md entry
-# as its notes.
+# as its notes, and a signed record that this workflow built it.
 name: Release
 
 on:
@@ -8,7 +8,10 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: write           # publish the release
+  id-token: write           # sign the build record (actions/attest)
+  attestations: write       # store it
+  artifact-metadata: write
 
 jobs:
   release:
@@ -52,6 +55,17 @@ jobs:
           cp build/x64-release/bin/pyinex.xll build/x64-release/bin/pyinex_core.dll \
              LICENSE NOTICE "pyinex-$VERSION/"
           7z a "pyinex-$VERSION-x64.zip" "pyinex-$VERSION"
+
+      # A signed record that this workflow built these files, from this tag's commit:
+      # gh attestation verify <file> -R rosslevinsky/pyinex checks a download against it.
+      # The DLLs are named as well as the zip so that extracted files can be checked too.
+      - name: Record how the files were built
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            pyinex-${{ env.VERSION }}-x64.zip
+            pyinex-${{ env.VERSION }}/pyinex.xll
+            pyinex-${{ env.VERSION }}/pyinex_core.dll
 
       # The notes are the lines under "## <version>" in CHANGELOG.md, up to the next "## ".
       - name: Write the release notes

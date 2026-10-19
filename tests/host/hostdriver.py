@@ -7,7 +7,8 @@
 Values go to and come back from Excel as Python values: ``float`` for numbers, ``str``,
 ``bool``, ``Err`` for Excel errors, ``MISSING`` for an argument left out, ``None`` for an
 empty value, and a tuple of row tuples for an array. ``Int`` sends Excel's rarely used
-xltypeInt.
+xltypeInt, and ``Ref`` and ``SRef`` the references Excel passes a parameter that takes one,
+which read the cells ``set_cells`` puts in the host's sheets.
 
 After every request the driver asks the host for faults — breaks of Excel's memory rules
 — and raises ``HostFault`` if there are any, unless the request said it expects them.
@@ -41,6 +42,44 @@ class Err:
 @dataclass(frozen=True)
 class Int:
     value: int
+
+
+def _area(address: str) -> str:
+    """An address, B2 or B2:C3 (a whole column D:D or row 5:5 too), as the host's area:
+    first row, last row, first column, last column, counted from 0."""
+    import re
+
+    def corner(text, last):
+        letters, digits = re.fullmatch(r"([A-Z]*)(\d*)", text).groups()
+        column = 0
+        for c in letters:
+            column = column * 26 + ord(c) - 64
+        row = int(digits) if digits else (1048576 if last else 1)
+        return row - 1, (column or (16384 if last else 1)) - 1
+
+    first, _, last = address.upper().partition(":")
+    (r1, c1), (r2, c2) = corner(first, False), corner(last or first, True)
+    return f"{r1},{r2},{c1},{c2}"
+
+
+@dataclass(frozen=True)
+class Ref:
+    """A reference Excel passes for a parameter that takes one (xltypeRef): its sheet, as
+    Excel names it ("[Book1]Sheet1"), and one or more areas, as addresses."""
+
+    sheet: str
+    areas: tuple
+
+    def __init__(self, sheet: str, *areas: str):
+        object.__setattr__(self, "sheet", sheet)
+        object.__setattr__(self, "areas", areas)
+
+
+@dataclass(frozen=True)
+class SRef:
+    """A reference with no sheet (xltypeSRef), on the sheet calculating: one area."""
+
+    area: str
 
 
 class _Missing:
@@ -82,6 +121,10 @@ def encode(value) -> str:
         return f"e:{value.code}"
     if isinstance(value, Int):
         return f"i:{value.value}"
+    if isinstance(value, Ref):
+        return f"r:{_hex(value.sheet)}:" + ";".join(_area(a) for a in value.areas)
+    if isinstance(value, SRef):
+        return f"R:{_area(value.area)}"
     if isinstance(value, (int, float)):
         return f"n:{float(value)!r}"
     if isinstance(value, str):
@@ -266,8 +309,9 @@ class Host:
         """Loads another DLL into the host, as another add-in might."""
         self._request(f"load {_hex(str(dll))}")
 
-    def open(self) -> float:
-        tokens, _ = self._checked(f"open {_hex(str(self.xll))}", False)
+    def open(self, xll: Path | None = None) -> float:
+        """Loads the add-in and calls its xlAutoOpen; xll: another copy of it instead."""
+        tokens, _ = self._checked(f"open {_hex(str(xll or self.xll))}", False)
         return decode(tokens)
 
     def close(self) -> float:
@@ -347,6 +391,67 @@ class Host:
         else:
             self._request(f"caller {_hex(sheet)} {row} {column} {rows} {columns}" + (" sref" if sref else ""))
 
+    def set_cells(self, sheet: str, cell: str, value) -> None:
+        """Puts a value, or an array's values from cell on, into a sheet's cells, which a
+        reference's xlCoerce and COUNTA read; None empties a cell."""
+        row, _, column, _ = (int(n) for n in _area(cell).split(","))
+        self._request(f"cells {_hex(sheet)} {row + 1} {column + 1} {encode(value)}")
+
+    def stop(self, code: str, skip: int = 0) -> None:
+        """After skip more readings of a reference, Excel answers code, "uncalced" or "abort"
+        (xlretUncalced, xlretAbort), as for a cell not yet calculated or an interrupted
+        calculation; "none" undoes it. Any later call into Excel but xlFree, before the
+        function that met it returns, is a fault."""
+        self._request(f"stop {code} {skip}")
+
+    def forget(self, sheet: str) -> None:
+        """The sheet is deleted, or its workbook closed: Excel no longer finds it by its name
+        (xlSheetId), and gives its ID to the next sheet named, as Excel may."""
+        self._request(f"forget {_hex(sheet)}")
+
+    def set_formula(self, sheet: str, cell: str, formula: str) -> None:
+        """Puts a formula in a sheet's cell, which the stand-in for Excel's Application object
+        finds through its Workbooks, as [Book1]Sheet1 is a sheet of the workbook Book1."""
+        row, _, column, _ = (int(n) for n in _area(cell).split(","))
+        self._request(f"formula {_hex(sheet)} {row + 1} {column + 1} {_hex(formula)}")
+
+    def set_array(self, sheet: str, area: str, formula: str) -> None:
+        """Puts a legacy array formula (Ctrl+Shift+Enter) in an area of a sheet, such as A1:B2,
+        which only the area's FormulaArray enters again."""
+        r1, r2, c1, c2 = (int(n) for n in _area(area).split(","))
+        self._request(f"array {_hex(sheet)} {r1 + 1} {c1 + 1} {r2 - r1 + 1} {c2 - c1 + 1} {_hex(formula)}")
+
+    def lock(self, sheet: str, locked: bool = True, unreadable: bool = False) -> None:
+        """Whether entering a formula on the sheet fails, as on a protected sheet; with
+        unreadable, reading one fails too."""
+        self._request(f"lock {_hex(sheet)} {2 if unreadable else int(locked)}")
+
+    def set_handler(self, search: str) -> None:
+        """After each formula entered again, Excel's search is for search, as when a
+        workbook's change handler calls Range.Find; empty, none."""
+        self._request(f"handler {_hex(search)}")
+
+    def set_change(self, verb: str = "", name: str = "") -> None:
+        """After each formula entered again, the host runs the command name (verb "run"), as
+        a workbook's change handler running a command would; no verb, none. The host reports
+        a fault once it has run it 25 times."""
+        self._request(f"change {verb} {_hex(name)}" if verb else "change")
+
+    def opened(self, book: str, new: bool = False) -> bool:
+        """Excel reports the workbook opened (WorkbookOpen), or with new made from a template
+        (NewWorkbook); returns whether a handler of Excel's application events was connected
+        to hear it."""
+        tokens, _ = self._checked(f"opened {_hex(book)}" + (" new" if new else ""), False)
+        return decode(tokens)
+
+    def entered(self) -> tuple[list[tuple], int]:
+        """Each formula entered again since the last call, as (sheet, address, formula,
+        value; None where the host does not calculate it), and how many times the add-in
+        asked Excel to calculate (xlcCalculateNow) meanwhile."""
+        tokens, _ = self._checked("entered", False)
+        calculations = int(decode(tokens))
+        return [tuple(row) for row in decode(tokens)], calculations
+
     def set_escape(self, pressed: bool) -> None:
         self._request(f"abort {int(pressed)}")
 
@@ -364,6 +469,89 @@ class Host:
     def set_wizard(self, open: bool) -> None:
         """Opens or closes a stand-in for Excel's function wizard."""
         self._request(f"wizard {int(open)}")
+
+    def run(self, name: str) -> float:
+        """Runs a registered command as Excel runs one in a command context, the host's
+        stand-in for Application.Run; returns its result."""
+        tokens, _ = self._checked(f"run {_hex(name)}", False)
+        return decode(tokens)
+
+    def tick(self, count: int = 1) -> tuple[bool, int, int]:
+        """Sends the add-in's queue window its timer's message count times; returns whether
+        the window exists, and how many times the add-in called Application.Run and how
+        many of those the host refused meanwhile."""
+        tokens, _ = self._checked(f"tick {count}", False)
+        return decode(tokens), int(decode(tokens)), int(decode(tokens))
+
+    def set_workbook(self, state: str) -> None:
+        """Whether a workbook window is open: "none", "open" (the default),
+        "protected", a Protected View window, whose object has no Application, or "both", a
+        workbook window and an active Protected View window, while which Evaluate gives #N/A."""
+        self._request(f"workbook {state}")
+
+    def set_busy(self, busy: bool) -> None:
+        """Whether Application.Run and Evaluate refuse, as Excel does while a cell is edited."""
+        self._request(f"busy {int(busy)}")
+
+    def fail_registrations(self, count: int) -> None:
+        """Makes the add-in's next count registrations of direct functions fail."""
+        self._request(f"fail register {count}")
+
+    def fail_commands(self, count: int) -> None:
+        """Makes the add-in's next count registrations of commands fail."""
+        self._request(f"fail command {count}")
+
+    def fail_name(self, name: str) -> None:
+        """Makes the add-in's next registration under name fail."""
+        self._request(f"fail name {_hex(name)}")
+
+    def fail_unregisters(self, count: int, skip: int = 0) -> None:
+        """After skip more calls of xlfUnregister that succeed, makes the next count fail."""
+        self._request(f"fail unregister {count} {skip}")
+
+    def fail_set_names(self, count: int) -> None:
+        """Makes the next count calls of xlfSetName fail, as Excel's FALSE says it failed."""
+        self._request(f"fail setname {count}")
+
+    def foreign(self, name: str) -> None:
+        """Registers name as if another add-in had."""
+        self._request(f"foreign {_hex(name)}")
+
+    def fail_windows(self, count: int) -> None:
+        """Makes the add-in's next count attempts to create its queue window fail."""
+        self._request(f"fail window {count}")
+
+    def fail_timers(self, count: int) -> None:
+        """Makes the add-in's next count calls of SetTimer fail."""
+        self._request(f"fail timer {count}")
+
+    def fail_evaluates(self, count: int) -> None:
+        """Makes the next count calls of xlfEvaluate fail, as a question Excel cannot answer."""
+        self._request(f"fail evaluate {count}")
+
+    def fail_memory(self, after: str, skip: int = 0) -> None:
+        """Once the add-in's next xlfEvaluate (after "evaluate"), its next registration of a
+        worksheet function that succeeds ("register"), or its next xlfUnregister that fails
+        ("unregister"), returns, or at once ("now"), makes its next allocation after skip
+        more fail, as when memory runs out; with "now", the core's too, once Python has
+        started."""
+        self._request(f"fail memory {after} {skip}")
+
+    def nest(self, verb: str, name: str, *args) -> None:
+        """The next time the add-in registers a direct function, the host first runs
+        the command name (verb "run") or calls the function name with args ("call")."""
+        self._request(" ".join(["nest", verb, _hex(name)] + [encode(a) for a in args]))
+
+    def nest_all(self, *requests: str) -> None:
+        """The next time the add-in registers a direct function, the host first carries out
+        each request in turn, a line of nest's: "run <hex name>", "call ...", or
+        "memory <skip>", making the add-in's next allocation after skip more fail."""
+        self._request("nest " + ";".join(requests))
+
+    def nest_at(self, procedure: str, *requests: str) -> None:
+        """As nest_all, at the add-in's next registration of a function or command whose
+        procedure starts with procedure (xlAutoRemove: the stand-in a removal registers)."""
+        self._request(f"nestat {_hex(procedure)} " + ";".join(requests))
 
     def quit(self) -> int:
         try:

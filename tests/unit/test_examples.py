@@ -2,9 +2,10 @@
 
 tests/excel/test_examples.py compares each formula's result with the expected value beside it
 in real Excel. These tests check what that comparison relies on: that every formula has
-an expected value beside it, calls only the documented functions, and names a script and
-function that exist; and that the committed workbooks are what scripts/make_examples.py
-writes. They need openpyxl, and run on any system.
+an expected value beside it, calls only the documented functions or the direct functions
+its workbook's own script declares, and names a script and function that exist; and that
+the committed workbooks are what scripts/make_examples.py writes. They need openpyxl, and
+run on any system.
 """
 
 import ast
@@ -50,6 +51,25 @@ def checks(path):
                     yield ws, cell, cell.value, 1, 1
 
 
+def declared(path):
+    """The direct functions the workbook's own script marks @pyinex.func, by the names Excel
+    is given, if the workbook loads that script with PyLoad; otherwise none."""
+    script = path.with_suffix(".py")
+    if not any(f'PyLoad("{script.name}")' in formula for _, _, formula, _, _ in checks(path)):
+        return set()
+    names = set()
+    for node in ast.parse(script.read_text("utf-8")).body:
+        if not isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            continue
+        for mark in node.decorator_list:
+            call = mark if isinstance(mark, ast.Call) else None
+            if ast.unparse(call.func if call else mark) != "pyinex.func":
+                continue
+            given = [k.value.value for k in call.keywords if k.arg == "name"] if call else []
+            names.add(given[0] if given else node.name)
+    return names
+
+
 def cell_contents(path):
     wb = openpyxl.load_workbook(path)
     return {
@@ -59,7 +79,7 @@ def cell_contents(path):
 
 
 def test_the_documented_functions_are_found():
-    assert DOCUMENTED == {"PyCall", "PyConsole", "PyReloadOnChange", "PyInfo"}
+    assert DOCUMENTED == {"PyCall", "PyConsole", "PyReloadOnChange", "PyInfo", "PyLoad"}
 
 
 def test_there_is_a_workbook_for_each_script():
@@ -82,10 +102,18 @@ def test_every_formula_has_an_expected_value_beside_it(path):
 
 @pytest.mark.parametrize("path", WORKBOOKS, ids=lambda p: p.name)
 def test_every_formula_calls_only_documented_functions(path):
+    direct = declared(path)
     for ws, cell, formula, _, _ in checks(path):
         names = set(re.findall(r"([A-Za-z_][\w.]*)\(", re.sub(r'"[^"]*"', '""', formula)))
-        assert names & DOCUMENTED, f"{ws.title}!{cell.coordinate}: {formula} calls no Pyinex function"
-        assert names <= DOCUMENTED | EXCEL, f"{ws.title}!{cell.coordinate}: {formula}"
+        assert names & (DOCUMENTED | direct), f"{ws.title}!{cell.coordinate}: {formula} calls no Pyinex function"
+        assert names <= DOCUMENTED | EXCEL | direct, f"{ws.title}!{cell.coordinate}: {formula}"
+
+
+def test_a_direct_function_is_accepted_only_from_the_workbooks_own_loaded_script():
+    assert declared(EXAMPLES / "direct_functions.xlsx") == {
+        "Discount", "CompoundGrowth", "Total", "Where", "UsedRows", "FilledCells"
+    }
+    assert declared(EXAMPLES / "ranges.xlsx") == set()  # It loads no script with PyLoad.
 
 
 @pytest.mark.parametrize("path", WORKBOOKS, ids=lambda p: p.name)
@@ -100,6 +128,8 @@ def test_every_pycall_names_a_script_and_function_that_exist(path):
                 t.id for n in tree.body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)
             }
             assert function in defined, f"{ws.title}!{cell.coordinate}: {function} is not in {script}"
+        for script in re.findall(r'PyLoad\("([^"]+)"', formula):
+            assert script == path.with_suffix(".py").name, f"{ws.title}!{cell.coordinate}: {formula}"
 
 
 def test_the_workbooks_are_what_the_generator_writes(tmp_path):

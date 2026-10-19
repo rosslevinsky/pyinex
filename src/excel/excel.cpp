@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cwchar>
+#include <iterator>
 #include <utility>
 
 namespace pyinex::excel {
@@ -141,15 +142,21 @@ void ExcelValue::reset() {
     x_ = {.xltype = xltypeNil};
 }
 
+int stop_code = -1;
+int calculating = 0;
+
 int call(int function, ExcelValue* result, std::span<const XLOPER12* const> args) {
-    // Excel's callback is not const-correct; Excel does not change its arguments.
-    std::vector<LPXLOPER12> opers;
-    opers.reserve(args.size());
-    for (const auto* a : args) opers.push_back(const_cast<LPXLOPER12>(a));
     if (result) result->reset();  // A reused result frees what it held.
+    if (stop_code > 0 && function != xlFree) return stop_code;
+    // Excel's callback is not const-correct; Excel does not change its arguments. Nothing is
+    // allocated, so a call into Excel cannot fail for want of memory: Excel takes at most 255.
+    LPXLOPER12 opers[255];
+    if (args.size() > std::size(opers)) return xlretInvCount;
+    for (size_t i = 0; i < args.size(); ++i) opers[i] = const_cast<LPXLOPER12>(args[i]);
     XLOPER12 scratch{.xltype = xltypeNil};
     XLOPER12* out = result ? &result->x_ : &scratch;
-    const int ret = call_excel(function, out, static_cast<int>(opers.size()), opers.data());
+    const int ret = call_excel(function, out, static_cast<int>(args.size()), opers);
+    if (stop_code == 0 && (ret == xlretUncalced || ret == xlretAbort)) stop_code = ret;
     if (ret == xlretSuccess) {
         if (result) result->owned_ = true;
         else {
@@ -168,15 +175,20 @@ std::wstring caller_folder() {
     ExcelValue caller, name;
     // A reference with its sheet (xltypeRef) or without (xltypeSRef, the sheet calculating):
     // Excel may give either, and CELL takes both.
-    if (call(xlfCaller, &caller) != xlretSuccess) return L"";
-    if (const int type = caller.get().xltype & ~xlbitXLFree; type != xltypeRef && type != xltypeSRef) return L"";
+    if (call(xlfCaller, &caller) != xlretSuccess) return L"?Excel did not say which cell is calling";
+    if (const int type = caller.get().xltype & ~xlbitXLFree; type != xltypeRef && type != xltypeSRef)
+        return L"?this call does not come from a cell, so it has no workbook";
     // C:\folder\[Book.xlsx]Sheet1; C:\folder\Book.xlsx when the workbook's only sheet has its
-    // name; or empty text for a workbook never saved.
+    // name; a web address, https://.../[Book.xlsx]Sheet1, for a workbook stored on OneDrive or
+    // SharePoint and opened from there; or empty text for a workbook never saved.
     const Value info = Value::text(L"filename");
     if (call(xlfCell, &name, {&info.get(), &caller.get()}) != xlretSuccess ||
         (name.get().xltype & ~xlbitXLFree) != xltypeStr)
-        return L"";
+        return L"?Excel did not say where the workbook is";
     const std::wstring_view text(name.get().val.str + 1, name.get().val.str[0]);
+    if (text.find(L"://") != std::wstring_view::npos)
+        return L"?this workbook is stored on the web, at " + std::wstring(text.substr(0, text.rfind(L'['))) +
+               L", not in a folder";
     // The folder ends at the last \: neither a workbook's name nor a sheet's may hold one.
     const auto slash = text.rfind(L'\\');
     return slash == std::wstring_view::npos ? L"" : std::wstring(text.substr(0, slash + 1));
@@ -201,31 +213,69 @@ bool in_function_wizard() {
     return found;
 }
 
-int register_functions(std::span<const Function> functions) {
+double register_function(const Function& f) {
     ExcelValue module;  // The add-in's own path, which xlfRegister needs first.
     if (call(xlGetName, &module) != xlretSuccess) return 0;
+    std::vector<Value> values;
+    values.push_back(Value::text(f.procedure));
+    values.push_back(Value::text(f.type));
+    values.push_back(Value::text(f.name));
+    values.push_back(Value::text(f.arguments));
+    values.push_back(Value::number(f.macro_type));
+    values.push_back(Value::text(f.category));
+    values.push_back(Value::missing());  // No shortcut key.
+    values.push_back(Value::missing());  // No help file.
+    values.push_back(Value::text(f.help));
+    for (const auto& h : f.argument_help) values.push_back(Value::text(h));
+    // One more, empty, as Microsoft advises: Excel shows the last help text it is given short.
+    values.push_back(Value::text(L""));
 
-    int registered = 0;
-    for (const auto& f : functions) {
-        std::vector<Value> values;
-        values.push_back(Value::text(f.procedure));
-        values.push_back(Value::text(f.type));
-        values.push_back(Value::text(f.name));
-        values.push_back(Value::text(f.arguments));
-        values.push_back(Value::number(1));  // Macro type 1: a worksheet function.
-        values.push_back(Value::text(L"Pyinex"));
-        values.push_back(Value::missing());  // No shortcut key.
-        values.push_back(Value::missing());  // No help file.
-        values.push_back(Value::text(f.help));
-        for (const auto& h : f.argument_help) values.push_back(Value::text(h));
+    std::vector<const XLOPER12*> args{&module.get()};
+    for (const auto& v : values) args.push_back(&v.get());
+    ExcelValue id;
+    if (call(xlfRegister, &id, args) != xlretSuccess || id.get().xltype != xltypeNum) return 0;
+    return id.get().val.num;
+}
 
-        std::vector<const XLOPER12*> args{&module.get()};
-        for (const auto& v : values) args.push_back(&v.get());
-        ExcelValue id;
-        if (call(xlfRegister, &id, args) == xlretSuccess && id.get().xltype == xltypeNum)
-            ++registered;
-    }
-    return registered;
+namespace {
+
+bool is_true(const ExcelValue& v) { return (v.get().xltype & ~xlbitXLFree) == xltypeBool && v.get().val.xbool; }
+
+bool unregister(double id) {
+    const Value v = Value::number(id);
+    ExcelValue done;
+    return call(xlfUnregister, &done, {&v.get()}) == xlretSuccess && is_true(done);
+}
+
+}  // namespace
+
+bool unregister_function(double id, std::wstring_view name) {
+    // Unregistering leaves the name holding the ID, which the export gets again when it is
+    // next registered, under any name. So a command is registered under the name, the name
+    // deleted, and the command unregistered. What it needs is made first, so that running out
+    // of memory cannot stop it once the function is unregistered.
+    ExcelValue module, command, deleted;
+    const Value procedure = Value::text(L"xlAutoRemove"), type = Value::text(L"I"), n = Value::text(name),
+                none = Value::missing(), macro_type = Value::number(2);
+    if (!unregister(id)) return false;
+    if (call(xlGetName, &module) != xlretSuccess ||
+        call(xlfRegister, &command, {&module.get(), &procedure.get(), &type.get(), &n.get(), &none.get(), &macro_type.get()}) !=
+            xlretSuccess ||
+        (command.get().xltype & ~xlbitXLFree) != xltypeNum)
+        return false;
+    // TRUE only: Excel documents FALSE as failing to delete the name.
+    const bool deleted_name = call(xlfSetName, &deleted, {&n.get()}) == xlretSuccess && is_true(deleted);
+    return unregister(command.get().val.num) && deleted_name;
+}
+
+double known_name(std::wstring_view name) { return known_name(Value::text(name)); }
+
+double known_name(const Value& name) {
+    ExcelValue value;
+    if (call(xlfEvaluate, &value, {&name.get()}) != xlretSuccess) return unanswered;
+    const XLOPER12& v = value.get();
+    if ((v.xltype & ~xlbitXLFree) == xltypeNum) return v.val.num;
+    return (v.xltype & ~xlbitXLFree) == xltypeErr && v.val.err == xlerrName ? 0 : -1;
 }
 
 }  // namespace pyinex::excel

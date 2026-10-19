@@ -247,3 +247,21 @@ def test_pyconsole_clears_the_text(no_output_host):
     assert "some earlier output" in console_text(h)
     assert h.call("PyConsole", False, True) is False
     assert console_text(h) == ""
+
+
+
+def test_a_byte_that_is_not_utf8_never_holds_back_the_line_it_ends(no_output_host, tmp_path):
+    path = tmp_path / "bytes.py"
+    path.write_text("import os\n\ndef f():\n    os.write(1, b'caf\\xe9\\n')\n    return 1\n", encoding="utf-8")
+    assert no_output_host.call("PyCall", str(path), "f") == 1.0
+    assert wait_until(lambda: console_text(no_output_host).endswith("caf\ufffd\n"))
+
+
+def test_a_timer_that_cannot_start_before_python_says_so_on_the_console(xllhost, pyinex_xll):
+    # With no output, as in Excel, and Python not yet started, the note still reaches the
+    # console, which it makes.
+    with Host(xllhost, pyinex_xll, env=host_env(), output="none") as h:
+        h.set_workbook("none")  # So opening starts the queue's timer rather than running it.
+        h.fail_windows(1)
+        h.open()
+        assert wait_until(lambda: "Pyinex: cannot start the queue's timer" in console_text(h))

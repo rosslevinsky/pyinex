@@ -3,7 +3,8 @@
 _pyinex_testing.pyd is compiled from the same conversion sources as pyinex_core.dll and
 exposes them to pytest, so these tests need no Excel and no fake Excel. It comes from a
 build of the x64-release preset; set PYINEX_BUILD_DIR to use another build's bin folder.
-These tests run only on Windows, except test_examples.py, which needs only openpyxl.
+These tests run only on Windows, except test_examples.py, which needs only openpyxl, and
+the test_funcs*.py files, which need only Python (and NumPy, for test_funcs_annotations.py).
 
 Values cross the module as descriptions of Excel's XLOPER12 values, as tuples:
 
@@ -17,6 +18,7 @@ convert.
 import importlib.util
 import os
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -24,7 +26,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 if sys.platform != "win32":
-    collect_ignore = [p.name for p in Path(__file__).parent.glob("test_*.py") if p.name != "test_examples.py"]
+    collect_ignore = [p.name for p in Path(__file__).parent.glob("test_*.py") if p.name not in ("test_examples.py", "test_funcs.py", "test_funcs_names.py", "test_funcs_reload.py", "test_funcs_signatures.py", "test_funcs_annotations.py")]
 
 
 @pytest.fixture(scope="session")
@@ -85,3 +87,28 @@ def script(tmp_path):
         return path
 
     return write
+
+
+PYTHON_FILES = ROOT / "src" / "core" / "python"
+
+
+@pytest.fixture
+def core(monkeypatch):
+    """call.py and funcs.py run in one namespace, as the core runs them, under plain Python,
+    with a stand-in pyinex module offering the decorator, Range, and a _stopped that says
+    Excel never stopped a call (test_funcs_range.py stands in for the rest)."""
+    names = {}
+    for name in ("call.py", "funcs.py"):
+        exec(compile((PYTHON_FILES / name).read_bytes(), f"<pyinex/{name}>", "exec", dont_inherit=True), names)
+    monkeypatch.setitem(sys.modules, "pyinex", types.SimpleNamespace(func=names["func"], Range=names.get("Range"), _stopped=lambda: False))
+    return names
+
+
+@pytest.fixture
+def load(core, script):
+    """Writes a script and returns load_functions' rows for it."""
+
+    def run(text, name="model.py"):
+        return core["load_functions"](str(script(text, name=name)))
+
+    return run

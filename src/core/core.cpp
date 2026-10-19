@@ -2,11 +2,13 @@
 // chosen Python's DLLs, so its link to python3.dll resolves to that Python.
 
 #include "common/environment.h"
+#include "console/console.h"
 #include "core/api.h"
 #include "core/call.h"
 #include "core/convert.h"
 #include "core/module.h"
 #include "core/py.h"
+#include "core/python/bootstrap.py.h"
 #include "excel/excel.h"
 
 #include <string>
@@ -18,42 +20,7 @@ using pyinex::core::Ref;
 
 namespace {
 
-// Python code run once at start-up. Its namespace holds the helpers the C++ below calls.
-constexpr const char* bootstrap = R"(
-import os, sys
-
-# Output goes to Pyinex's console window through a pipe, to a captured stream, or to a
-# terminal: in UTF-8 whatever the code page, and a line at a time, so print() from a thread
-# a script started shows without waiting for a buffer to fill.
-for stream in (sys.stdout, sys.stderr):
-    try:
-        stream.reconfigure(encoding='utf-8', errors='backslashreplace', line_buffering=True)
-    except Exception:
-        pass
-
-def fix_up(base_executable, host_executable):
-    # Python sets sys.executable from __PYVENV_LAUNCHER__ but takes these two from the
-    # process's own .exe (Excel): make them what the chosen python.exe would have. Excel's
-    # folder stays on sys.path if it is one of Python's own or PYTHONPATH names it.
-    sys._base_executable = base_executable
-    def key(p):
-        return os.path.normcase(os.path.abspath(p))
-    host = key(os.path.dirname(host_executable))
-    keep = {key(sys.prefix), key(sys.base_prefix)}
-    keep.update(key(p) for p in os.environ.get('PYTHONPATH', '').split(os.pathsep) if p)
-    if host not in keep:
-        sys.path[:] = [p for p in sys.path if not p or key(p) != host]
-
-def info(item):
-    # PyInfo's items that only Python knows.
-    if item == 'version':
-        return sys.version
-    if item == 'prefix':
-        return sys.prefix
-    return sys.prefix != sys.base_prefix  # 'venv'
-)";
-
-PyObject* helpers;  // The bootstrap's namespace.
+PyObject* helpers;  // The namespace of src/core/python/bootstrap.py, run at start-up.
 
 // Holds the GIL for one call.
 class Gil {
@@ -69,10 +36,17 @@ private:
 
 // Calls one of the bootstrap's helpers; a new reference, or null with the error cleared.
 PyObject* call_helper(const char* name, PyObject* args) {
-    PyObject* f = PyDict_GetItemString(helpers, name);  // Borrowed.
+    PyObject* f = helpers ? PyDict_GetItemString(helpers, name) : nullptr;  // Borrowed.
     PyObject* result = f && args ? PyObject_CallObject(f, args) : nullptr;
     if (!result) PyErr_Clear();
     return result;
+}
+
+// A call's result for Excel: #VALUE! if Excel stopped the call (stop_code), decided
+// last, so that a stop met while the result converted or the call's Python objects were
+// released, by a finalizer, counts. Excel discards that result.
+LPXLOPER12 stop_checked(Value value) {
+    return (stop_code > 0 ? Value::error(xlerrValue) : std::move(value)).to_excel();
 }
 
 std::wstring module_path(HMODULE module) {
@@ -97,15 +71,19 @@ PYINEX_EXPORT int pyinex_start(const wchar_t* executable, const wchar_t* base_ex
         Py_InitializeEx(0);  // 0: leave Excel's signal handlers alone.
         bool ok = false;
         {  // Every reference here is released while the GIL is still held.
-            helpers = PyDict_New();
-            Ref builtins(PyImport_ImportModule("builtins"));
-            Ref ran(builtins.get() && helpers
-                        ? PyObject_CallMethod(builtins.get(), "exec", "sO", bootstrap, helpers)
-                        : nullptr);
+            const wchar_t* step = L"running bootstrap.py";
+            helpers = pyinex::core::run_core_python(pyinex::core::python::bootstrap_py, "bootstrap.py");
             Ref args(Py_BuildValue("(uu)", base_executable, module_path(nullptr).c_str()));
-            Ref fixed(ran.get() ? call_helper("fix_up", args.get()) : nullptr);
-            ok = fixed.get() != nullptr && pyinex::core::start_conversion() && pyinex::core::start_module() &&
-                 pyinex::core::start_calls();
+            PyObject* fix_up = helpers ? PyDict_GetItemString(helpers, "fix_up") : nullptr;  // Borrowed.
+            Ref fixed(fix_up && args.get() && (step = L"setting up sys") ? PyObject_CallObject(fix_up, args.get()) : nullptr);
+            ok = fixed.get() != nullptr && (step = L"making pyinex.ExcelError", pyinex::core::start_conversion()) &&
+                 (step = L"running call.py and funcs.py", pyinex::core::start_calls()) &&
+                 (step = L"making the pyinex module", pyinex::core::start_module());
+            // Said here, as nothing after can say why: Python cannot start again in this Excel.
+            if (!ok)
+                pyinex::console::note(std::wstring(L"Python started, but Pyinex could not set it up: ") + step +
+                                      L" failed (" + pyinex::core::python_error() +
+                                      L"). Fix the cause, then restart Excel: Python cannot start again within it.");
             PyErr_Clear();
         }
         PyEval_SaveThread();  // Release the GIL; each call takes it again.
@@ -125,13 +103,53 @@ PYINEX_EXPORT LPXLOPER12 pyinex_call(const XLOPER12* file, const XLOPER12* funct
         // After the call has released its Python objects, so what their finalizers print
         // is written out too.
         pyinex::core::flush();
-        return value.to_excel();
+        return stop_checked(std::move(value));
+    });
+}
+
+PYINEX_EXPORT LPXLOPER12 pyinex_load(const XLOPER12* file, bool reload_on_change) {
+    return guarded([&] {
+        Gil gil;
+        const pyinex::core::OutsideCall outside;  // The script runs outside any call, even PyLoad within one.
+        const LPXLOPER12 rows = pyinex::core::load_functions(*file, reload_on_change, caller_folder);
+        pyinex::core::flush();
+        return rows;
+    });
+}
+
+PYINEX_EXPORT LPXLOPER12 pyinex_changes() {
+    return guarded([&] {
+        Gil gil;
+        return pyinex::core::changes();
+    });
+}
+
+PYINEX_EXPORT void pyinex_registered(int key, bool registered) {
+    try {
+        Gil gil;
+        if (PyObject* f = pyinex::core::helper("registered"))  // Borrowed.
+            Ref done(PyObject_CallFunction(f, "ii", key, registered ? 1 : 0));
+        PyErr_Clear();
+    } catch (...) {
+    }
+}
+
+PYINEX_EXPORT LPXLOPER12 pyinex_function(int key, const wchar_t* name, const XLOPER12* const* args, int count,
+                                         bool reload_on_change) {
+    return guarded([&] {
+        Gil gil;
+        const pyinex::core::ExcelCall excel_call;  // As pyinex_call's.
+        Value value =
+            pyinex::core::call_function(key, name, {args, static_cast<size_t>(count)}, reload_on_change);
+        pyinex::core::flush();
+        return stop_checked(std::move(value));
     });
 }
 
 PYINEX_EXPORT void pyinex_close() {
     try {
         Gil gil;
+        const pyinex::core::OutsideCall outside;  // Even should Excel close the add-in within a call.
         pyinex::core::flush();
     } catch (...) {
     }
