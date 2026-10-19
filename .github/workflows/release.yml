@@ -41,8 +41,8 @@ jobs:
       - name: Build
         run: cmake --build --preset x64-release
 
-      - name: Install pytest and openpyxl
-        run: python -m pip install pytest openpyxl
+      - name: Install pytest, openpyxl and NumPy
+        run: python -m pip install pytest openpyxl numpy
 
       - name: Test
         env:
